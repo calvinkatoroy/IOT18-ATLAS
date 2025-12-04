@@ -1,7 +1,8 @@
 /*
- * ATLAS - Proof of Concept (Simple Version) - FIXED
+ * ATLAS - Proof of Concept (Simple Version) - RTOS Implementation
  * ESP32 + RFID + BLE Beacon Scanner
  * Database: Preferences.h
+ * Architecture: FreeRTOS Multi-Tasking
  */
 
 #include <SPI.h>
@@ -10,6 +11,10 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 #include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
 
 // ======================== PIN DEFINITIONS ========================
 #define SS_PIN    21
@@ -31,6 +36,25 @@ const char* PREF_NAMESPACE = "atlas_db";
 // ======================== GLOBAL VARS ========================
 String detectedBeaconUUID = "";
 int detectedRSSI = -100;
+
+// ======================== RTOS HANDLES & QUEUES ========================
+TaskHandle_t rfidTaskHandle = NULL;
+TaskHandle_t commandTaskHandle = NULL;
+TaskHandle_t attendanceTaskHandle = NULL;
+SemaphoreHandle_t rfidMutex = NULL;
+SemaphoreHandle_t prefMutex = NULL;
+QueueHandle_t cardQueue = NULL;  // Queue untuk pass card UID dari RFID task
+QueueHandle_t commandQueue = NULL;  // Queue untuk pass command dari command task
+
+// ======================== STRUCTURES ========================
+struct CardData {
+  String cardUID;
+  String safeKey;
+};
+
+struct CommandData {
+  String command;
+};
 
 // ======================== BLE CALLBACK ========================
 class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
@@ -60,7 +84,7 @@ void setup() {
   while (!Serial);
   
   Serial.println("\n╔════════════════════════════════════════╗");
-  Serial.println("║   ATLAS - Proof of Concept (Simple)   ║");
+  Serial.println("║   ATLAS - RTOS Implementation         ║");
   Serial.println("║   RFID + BLE Beacon Dual-Factor Auth  ║");
   Serial.println("╚════════════════════════════════════════╝\n");
   
@@ -82,6 +106,55 @@ void setup() {
   pBLEScan->setWindow(99);
   Serial.println("✓ BLE Scanner initialized");
   
+  // ======================== RTOS INITIALIZATION ========================
+  // Create Mutexes
+  rfidMutex = xSemaphoreCreateMutex();
+  prefMutex = xSemaphoreCreateMutex();
+  
+  // Create Queues
+  cardQueue = xQueueCreate(5, sizeof(CardData));
+  commandQueue = xQueueCreate(5, sizeof(CommandData));
+  
+  if (rfidMutex == NULL || prefMutex == NULL || cardQueue == NULL || commandQueue == NULL) {
+    Serial.println("✗ Failed to create RTOS resources!");
+    while(1) delay(1000);
+  }
+  
+  Serial.println("✓ RTOS mutexes and queues initialized");
+  
+  // Create Tasks
+  xTaskCreatePinnedToCore(
+    rfidScanTask,           // Task function
+    "RFID_Scanner",         // Task name
+    4096,                   // Stack size
+    NULL,                   // Parameters
+    2,                      // Priority (higher = more important)
+    &rfidTaskHandle,        // Task handle
+    0                       // Core 0
+  );
+  
+  xTaskCreatePinnedToCore(
+    commandTask,
+    "Command_Handler",
+    4096,
+    NULL,`
+    2,
+    &commandTaskHandle,
+    0
+  );
+  
+  xTaskCreatePinnedToCore(
+    attendanceTask,
+    "Attendance_Processor",
+    8192,                   // Larger stack for BLE scanning
+    NULL,
+    1,                      // Lower priority
+    &attendanceTaskHandle,
+    1                       // Core 1 (BLE work better on core 1)
+  );
+  
+  Serial.println("✓ RTOS tasks created");
+  
   Serial.println("\n════════════════════════════════════════");
   Serial.println("Commands:");
   Serial.println("  REGISTER - Daftarkan kartu baru");
@@ -95,55 +168,144 @@ void setup() {
   Serial.println("\nSilakan tap kartu atau ketik command...\n");
 }
 
-// ======================== LOOP ========================
+// ======================== LOOP (IDLE TASK) ========================
 void loop() {
-  // Cek command
-  if (Serial.available() > 0) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    cmd.toUpperCase();
-    
-    if (cmd == "TABLE") {
-      displayDatabase();
-    } else if (cmd == "CLEAR") {
-      clearDatabase();
-    } else if (cmd == "REGISTER") {
-      registerMode();
-    }
-  }
-  
-  // Cek RFID
-  if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
-    String cardUID = getCardUID();
-    
-    Serial.println("\n╔════════════════════════════════════════╗");
-    Serial.println("║         KARTU TERDETEKSI!              ║");
-    Serial.println("╚════════════════════════════════════════╝");
-    Serial.print("UID: ");
-    Serial.println(cardUID);
-    
-    // Cek apakah kartu terdaftar
-    String safeKey = cardUID;
-    safeKey.replace(" ", "");
-    
-    if (preferences.isKey(safeKey.c_str())) {
-      // Kartu terdaftar - mulai validasi
-      processAttendance(cardUID, safeKey);
-    } else {
-      // Kartu belum terdaftar
-      Serial.println("\n✗ Kartu tidak terdaftar!");
-      Serial.println("Ketik 'REGISTER' untuk mendaftar.\n");
-    }
-    
-    mfrc522.PICC_HaltA();
-    mfrc522.PCD_StopCrypto1();
-    delay(2000);
-  }
-  
-  delay(100);
+  // Loop now just idles, all work is done in RTOS tasks
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
 // ======================== FUNCTIONS ========================
+
+// ======================== RTOS TASKS ========================
+
+/**
+ * Task: RFID Scanner
+ * Continuously monitors RFID reader for card detection
+ * Sends detected cards to queue for processing
+ */
+void rfidScanTask(void *pvParameters) {
+  Serial.println("[RFID Task] Started on core 0");
+  
+  while (1) {
+    // Check for new card (non-blocking)
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      // Take mutex before accessing RFID data
+      if (xSemaphoreTake(rfidMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        String cardUID = getCardUID();
+        String safeKey = cardUID;
+        safeKey.replace(" ", "");
+        
+        Serial.println("\n╔════════════════════════════════════════╗");
+        Serial.println("║         KARTU TERDETEKSI!              ║");
+        Serial.println("╚════════════════════════════════════════╝");
+        Serial.print("UID: ");
+        Serial.println(cardUID);
+        
+        // Create card data structure
+        CardData card;
+        card.cardUID = cardUID;
+        card.safeKey = safeKey;
+        
+        // Send to queue
+        if (xQueueSend(cardQueue, &card, pdMS_TO_TICKS(100)) != pdPASS) {
+          Serial.println("✗ Card queue full, card discarded");
+        }
+        
+        mfrc522.PICC_HaltA();
+        mfrc522.PCD_StopCrypto1();
+        
+        xSemaphoreGive(rfidMutex);
+        
+        // Debounce delay
+        vTaskDelay(pdMS_TO_TICKS(2000));
+      }
+    }
+    
+    // Small delay to prevent watchdog timeout
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+/**
+ * Task: Serial Command Handler
+ * Monitors serial input for user commands
+ * Sends commands to queue for processing
+ */
+void commandTask(void *pvParameters) {
+  Serial.println("[Command Task] Started on core 0");
+  
+  while (1) {
+    if (Serial.available() > 0) {
+      String cmd = Serial.readStringUntil('\n');
+      cmd.trim();
+      cmd.toUpperCase();
+      
+      CommandData command;
+      command.command = cmd;
+      
+      // Send to queue
+      if (xQueueSend(commandQueue, &command, pdMS_TO_TICKS(100)) != pdPASS) {
+        Serial.println("✗ Command queue full");
+      }
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+/**
+ * Task: Attendance Processor
+ * Processes card data and commands from queues
+ * Handles all attendance validation logic including BLE scanning
+ */
+void attendanceTask(void *pvParameters) {
+  Serial.println("[Attendance Task] Started on core 1");
+  CardData receivedCard;
+  CommandData receivedCommand;
+  
+  while (1) {
+    // Check card queue
+    if (xQueueReceive(cardQueue, &receivedCard, pdMS_TO_TICKS(100)) == pdPASS) {
+      // Process card attendance
+      if (xSemaphoreTake(prefMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        // Check if card is registered
+        if (preferences.isKey(receivedCard.safeKey.c_str())) {
+          // Process attendance
+          processAttendance(receivedCard.cardUID, receivedCard.safeKey);
+        } else {
+          // Card not registered
+          Serial.println("\n✗ Kartu tidak terdaftar!");
+          Serial.println("Ketik 'REGISTER' untuk mendaftar.\n");
+        }
+        
+        xSemaphoreGive(prefMutex);
+      } else {
+        Serial.println("✗ Timeout acquiring preference mutex");
+      }
+    }
+    
+    // Check command queue
+    if (xQueueReceive(commandQueue, &receivedCommand, pdMS_TO_TICKS(100)) == pdPASS) {
+      if (xSemaphoreTake(prefMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        if (receivedCommand.command == "TABLE") {
+          displayDatabase();
+        } else if (receivedCommand.command == "CLEAR") {
+          clearDatabase();
+        } else if (receivedCommand.command == "REGISTER") {
+          registerMode();
+        }
+        
+        xSemaphoreGive(prefMutex);
+      } else {
+        Serial.println("✗ Timeout acquiring preference mutex");
+      }
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ======================== HELPER FUNCTIONS ========================
 
 String getCardUID() {
   String content = "";
@@ -184,10 +346,10 @@ void processAttendance(String cardUID, String safeKey) {
   detectedBeaconUUID = "";
   detectedRSSI = -100;
   
-  // FIX: Gunakan pointer, bukan object
-  BLEScanResults* foundDevices = pBLEScan->start(BLE_SCAN_TIME, false);
+  // FIX: Gunakan object, bukan pointer
+  BLEScanResults foundDevices = pBLEScan->start(BLE_SCAN_TIME, false);
   Serial.print("Total devices found: ");
-  Serial.println(foundDevices->getCount());
+  Serial.println(foundDevices.getCount());
   pBLEScan->clearResults();
   
   // STEP 2: Validasi

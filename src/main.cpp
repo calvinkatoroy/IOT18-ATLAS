@@ -1,6 +1,11 @@
-#define BLYNK_TEMPLATE_ID "TMPL6VPh0o-Dm"
-#define BLYNK_TEMPLATE_NAME "ATLAS"
-#define BLYNK_AUTH_TOKEN "kXflwxH-ISh8FD4j2aTDssEML_PqumqY"
+/*
+ * ATLAS MASTER - MQTT + Blynk Controller
+ * Using HiveMQ Broker
+ */
+
+#define BLYNK_TEMPLATE_ID "TMPL6lIzoL-oI"
+#define BLYNK_TEMPLATE_NAME "finproIOT"
+#define BLYNK_AUTH_TOKEN "pK4XmlMzXLw3xHcehz5YDNcg4kXwfKVl"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -9,8 +14,8 @@
 #include <Preferences.h>
 
 // WiFi
-const char* ssid = "CALNATH";
-const char* password = "Calvin2304";
+const char* ssid = "Alga";
+const char* password = "bonifasius1103";
 
 // MQTT HiveMQ Broker
 const char* mqtt_server = "broker.hivemq.com";
@@ -45,17 +50,17 @@ struct AttendanceData {
 };
 
 struct RegistrationData {
-  char uid[30];
-  char npm[20];
-  char serviceUUID[50];
+  String uid;
+  String npm;
+  String serviceUUID;
 };
 
 struct CommandData {
   uint8_t type;  // 0=mode signal, 1=registration
   bool modeValue;
-  char uid[30];
-  char npm[20];
-  char serviceUUID[50];
+  String uid;
+  String npm;
+  String serviceUUID;
 };
 
 // Objects
@@ -83,29 +88,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // Topic: atlas/card (Slave sends card UID)
   if (strcmp(topic, TOPIC_CARD_SCANNED) == 0) {
     if (registerMode) {
-      Serial.printf("[REGISTER] Card UID received: %s\n", msg.c_str());
-      
-      // Store card UID
-      pendingCardUID = msg;
-      Serial.printf("[DEBUG] Stored pendingCardUID: '%s'\n", pendingCardUID.c_str());
-      Serial.printf("[DEBUG] Current pendingNPM: '%s'\n", pendingNPM.c_str());
-      Serial.printf("[DEBUG] Current pendingServiceUUID: '%s'\n", pendingServiceUUID.c_str());
+      Serial.printf("[REGISTER] Card UID: %s\n", msg.c_str());
       
       // Check if NPM and UUID already entered
       if (pendingNPM.length() > 0 && pendingServiceUUID.length() > 0) {
         // Complete registration immediately
-        Serial.println("[DEBUG] All data ready, creating registration...");
         RegistrationData reg;
-        
-        pendingCardUID.toCharArray(reg.uid, sizeof(reg.uid));
-        pendingNPM.toCharArray(reg.npm, sizeof(reg.npm));
-        pendingServiceUUID.toCharArray(reg.serviceUUID, sizeof(reg.serviceUUID));
-        
-        Serial.println("[DEBUG] RegistrationData created:");
-        Serial.printf("  reg.uid: '%s'\n", reg.uid);
-        Serial.printf("  reg.npm: '%s'\n", reg.npm);
-        Serial.printf("  reg.serviceUUID: '%s'\n", reg.serviceUUID);
-        
+        reg.uid = msg;
+        reg.npm = pendingNPM;
+        reg.serviceUUID = pendingServiceUUID;
         xQueueSend(registrationQueue, &reg, 0);
         
         pendingNPM = "";
@@ -114,6 +105,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         waitingForCard = false;
       } else {
         // Store UID and wait for NPM/UUID
+        pendingCardUID = msg;
         Serial.println("[REGISTER] Card stored. Waiting for NPM and UUID...");
       }
     }
@@ -152,7 +144,6 @@ BLYNK_WRITE(V0) {
     terminal.flush();
     
     // Allow card scan anytime in register mode
-    if (pendingNPM.lenght() > 0) pendingServiceUUID.length() = "00000000-0000-0000-0000-00" + string(pendingNPM.length());
     if (pendingNPM.length() > 0 && pendingServiceUUID.length() > 0) {
       waitingForCard = true;
       terminal.println("Ready! Tap card now...");
@@ -168,36 +159,53 @@ BLYNK_WRITE(V0) {
 
 BLYNK_WRITE(V1) {
   pendingNPM = param.asStr();
-  Serial.printf("[Blynk] NPM input: %s\n", pendingNPM.c_str());
-  Serial.printf("[DEBUG] pendingCardUID: '%s'\n", pendingCardUID.c_str());
-  Serial.printf("[DEBUG] pendingServiceUUID: '%s'\n", pendingServiceUUID.c_str());
+  Serial.printf("[Blynk] NPM: %s\n", pendingNPM.c_str());
   
   if (registerMode) {
     // Check if we have all data (including scanned card)
     if (pendingCardUID.length() > 0 && pendingServiceUUID.length() > 0) {
       // Complete registration now
-      Serial.println("[DEBUG] All data ready (from NPM input), creating registration...");
       RegistrationData reg;
-      
-      pendingCardUID.toCharArray(reg.uid, sizeof(reg.uid));
-      pendingNPM.toCharArray(reg.npm, sizeof(reg.npm));
-      pendingServiceUUID.toCharArray(reg.serviceUUID, sizeof(reg.serviceUUID));
-      
-      Serial.println("[DEBUG] RegistrationData created:");
-      Serial.printf("  reg.uid: '%s'\n", reg.uid);
-      Serial.printf("  reg.npm: '%s'\n", reg.npm);
-      Serial.printf("  reg.serviceUUID: '%s'\n", reg.serviceUUID);
-      
+      reg.uid = pendingCardUID;
+      reg.npm = pendingNPM;
+      reg.serviceUUID = pendingServiceUUID;
       xQueueSend(registrationQueue, &reg, 0);
       
       pendingNPM = "";
       pendingServiceUUID = "";
       pendingCardUID = "";
-      waitingForCard = false;
       
       terminal.println("✓ Registration processing...");
       terminal.flush();
     } else if (pendingServiceUUID.length() > 0) {
+      waitingForCard = true;
+      terminal.println("Ready! Tap card on slave...");
+      terminal.flush();
+    }
+  }
+}
+
+BLYNK_WRITE(V2) {
+  pendingServiceUUID = param.asStr();
+  Serial.printf("[Blynk] UUID: %s\n", pendingServiceUUID.c_str());
+  
+  if (registerMode) {
+    // Check if we have all data (including scanned card)
+    if (pendingCardUID.length() > 0 && pendingNPM.length() > 0) {
+      // Complete registration now
+      RegistrationData reg;
+      reg.uid = pendingCardUID;
+      reg.npm = pendingNPM;
+      reg.serviceUUID = pendingServiceUUID;
+      xQueueSend(registrationQueue, &reg, 0);
+      
+      pendingNPM = "";
+      pendingServiceUUID = "";
+      pendingCardUID = "";
+      
+      terminal.println("✓ Registration processing...");
+      terminal.flush();
+    } else if (pendingNPM.length() > 0) {
       waitingForCard = true;
       terminal.println("Ready! Tap card on slave...");
       terminal.flush();
@@ -341,16 +349,9 @@ void mqttManagementTask(void* param) {
         Serial.printf("[MQTT] Mode signal sent: %s\n", mode);
       } else if (cmd.type == 1) {
         // Send registration data
-        Serial.println("[DEBUG] Preparing registration MQTT message:");
-        Serial.printf("  cmd.uid: '%s' (len=%d)\n", cmd.uid, strlen(cmd.uid));
-        Serial.printf("  cmd.npm: '%s' (len=%d)\n", cmd.npm, strlen(cmd.npm));
-        Serial.printf("  cmd.serviceUUID: '%s' (len=%d)\n", cmd.serviceUUID, strlen(cmd.serviceUUID));
-        
         char payload[200];
         snprintf(payload, sizeof(payload), "%s|%s|%s", 
-                 cmd.uid, cmd.npm, cmd.serviceUUID);
-        
-        Serial.printf("[DEBUG] Formatted payload: '%s' (len=%d)\n", payload, strlen(payload));
+                 cmd.uid.c_str(), cmd.npm.c_str(), cmd.serviceUUID.c_str());
         publishMQTT(TOPIC_REGISTER_DATA, payload);
         Serial.println("[MQTT] Registration data sent");
       }
@@ -384,43 +385,33 @@ void mqttManagementTask(void* param) {
     // Process registration
     if (xQueueReceive(registrationQueue, &reg, 0) == pdPASS) {
       Serial.println("\n[REGISTER] Processing:");
-      Serial.printf("  UID : %s\n", reg.uid);
-      Serial.printf("  NPM : %s\n", reg.npm);
-      Serial.printf("  UUID: %s\n", reg.serviceUUID);
+      Serial.printf("  UID : %s\n", reg.uid.c_str());
+      Serial.printf("  NPM : %s\n", reg.npm.c_str());
+      Serial.printf("  UUID: %s\n", reg.serviceUUID.c_str());
       
       // Store locally
-      String safeKey = String(reg.uid);
+      String safeKey = reg.uid;
       safeKey.replace(" ", "");
-      String value = String(reg.npm) + "|" + String(reg.serviceUUID);
+      String value = reg.npm + "|" + reg.serviceUUID;
       prefs.putString(safeKey.c_str(), value);
       
-      // Send to slave: uid|npm|serviceUUID
+      // Send to slave
       CommandData regCmd;
       regCmd.type = 1;
-      strncpy(regCmd.uid, reg.uid, sizeof(regCmd.uid) - 1);
-      regCmd.uid[sizeof(regCmd.uid) - 1] = '\0';
-      strncpy(regCmd.npm, reg.npm, sizeof(regCmd.npm) - 1);
-      regCmd.npm[sizeof(regCmd.npm) - 1] = '\0';
-      strncpy(regCmd.serviceUUID, reg.serviceUUID, sizeof(regCmd.serviceUUID) - 1);
-      regCmd.serviceUUID[sizeof(regCmd.serviceUUID) - 1] = '\0';
-      
-      Serial.println("[DEBUG] Before queue send:");
-      Serial.printf("  regCmd.uid: '%s'\n", regCmd.uid);
-      Serial.printf("  regCmd.npm: '%s'\n", regCmd.npm);
-      Serial.printf("  regCmd.serviceUUID: '%s'\n", regCmd.serviceUUID);
-      
+      regCmd.uid = reg.uid;
+      regCmd.npm = reg.npm;
+      regCmd.serviceUUID = reg.serviceUUID;
       xQueueSend(commandQueue, &regCmd, 0);
       
       Serial.println("✓ Registration complete\n");
       
-      Blynk.virtualWrite(V5, "Registered: " + String(reg.npm));
-      terminal.println("✓ Registered: " + String(reg.npm));
-      terminal.println("  UID: " + String(reg.uid));
+      Blynk.virtualWrite(V5, "Registered: " + reg.npm);
+      terminal.println("✓ Registered: " + reg.npm);
+      terminal.println("  UID: " + reg.uid);
       terminal.flush();
       
       // Exit register mode
       registerMode = false;
-      waitingForCard = false;
       Blynk.virtualWrite(V0, 0);
       
       CommandData modeCmd;

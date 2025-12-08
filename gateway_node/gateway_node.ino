@@ -1,379 +1,477 @@
-#include <painlessMesh.h>
-#include <ArduinoJson.h>
+/*
+ * ATLAS MASTER - MQTT + Blynk Controller
+ * Using HiveMQ Broker
+ */
+
+#define BLYNK_TEMPLATE_ID "TMPL6VPh0o-Dm"
+#define BLYNK_TEMPLATE_NAME "ATLAS"
+#define BLYNK_AUTH_TOKEN "kXflwxH-ISh8FD4j2aTDssEML_PqumqY"
+
+#include <Arduino.h>
 #include <WiFi.h>
+#include <PubSubClient.h>
 #include <BlynkSimpleEsp32.h>
+#include <Preferences.h>
 
-// ═══════════════════════════════════════════════════════════════
-//                        CONFIGURATION
-// ═══════════════════════════════════════════════════════════════
+// WiFi
+const char* ssid = "CALNATH";
+const char* password = "Calvin2304";
 
-// Mesh Configuration
-#define MESH_PREFIX     "ATLAS_MESH"
-#define MESH_PASSWORD   "atlas2024"
-#define MESH_PORT       5555
+// MQTT HiveMQ Broker
+const char* mqtt_server = "broker.hivemq.com";
+const int mqtt_port = 1883;
+const char* mqtt_client_id = "ATLAS_Master_001";
 
-// WiFi Configuration
-#define WIFI_SSID       "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD"
+// MQTT Topics
+#define TOPIC_MODE           "atlas/mode"          // Master -> Slave: register/default
+#define TOPIC_REGISTER_DATA  "atlas/register"      // Master -> Slave: uid|npm|uuid
+#define TOPIC_CARD_SCANNED   "atlas/card"          // Slave -> Master: card UID
+#define TOPIC_ATTENDANCE     "atlas/attendance"    // Slave -> Master: uid|npm|rssi|valid
 
-// Blynk Configuration
-#define BLYNK_AUTH      "YOUR_BLYNK_AUTH_TOKEN"
+// State
+volatile bool registerMode = false;
+String pendingNPM = "";
+String pendingServiceUUID = "";
+String pendingCardUID = "";  // Store scanned UID until NPM/UUID ready
+volatile bool waitingForCard = false;
+int attendanceCount = 0;
 
-// Blynk Virtual Pins
-#define VPIN_REGISTRATION_TOGGLE  V0   // Switch untuk enable/disable registration
-#define VPIN_LAST_ATTENDANCE      V1   // Display last attendance
-#define VPIN_FRAUD_ALERT          V2   // LED for fraud alert
-#define VPIN_TOTAL_STUDENTS       V3   // Value display
-#define VPIN_TOTAL_SCANS          V4   // Value display
-#define VPIN_SUCCESS_SCANS        V5   // Value display
-#define VPIN_FRAUD_ATTEMPTS       V6   // Value display
-#define VPIN_ATTENDANCE_LOG       V7   // Terminal widget
-#define VPIN_REGISTRATION_LOG     V8   // Terminal widget
-#define VPIN_NODE_STATUS          V9   // LED for node connection
+// RTOS
+TaskHandle_t mqttTaskHandle = NULL;
+QueueHandle_t attendanceQueue = NULL;
+QueueHandle_t registrationQueue = NULL;
+QueueHandle_t commandQueue = NULL;
 
-// ═══════════════════════════════════════════════════════════════
-//                        GLOBAL OBJECTS
-// ═══════════════════════════════════════════════════════════════
+struct AttendanceData {
+  String uid;
+  String npm;
+  int rssi;
+  bool valid;
+};
 
-painlessMesh mesh;
-BlynkTimer timer;
-WidgetTerminal terminal(VPIN_ATTENDANCE_LOG);
-WidgetTerminal regTerminal(VPIN_REGISTRATION_LOG);
+struct RegistrationData {
+  char uid[30];
+  char npm[20];
+  char serviceUUID[50];
+};
 
-// ═══════════════════════════════════════════════════════════════
-//                        GLOBAL VARIABLES
-// ═══════════════════════════════════════════════════════════════
+struct CommandData {
+  uint8_t type;  // 0=mode signal, 1=registration
+  bool modeValue;
+  char uid[30];
+  char npm[20];
+  char serviceUUID[50];
+};
 
-bool registrationEnabled = false;
-unsigned long totalStudents = 0;
-unsigned long totalScans = 0;
-unsigned long successScans = 0;
-unsigned long fraudAttempts = 0;
+// Objects
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+Preferences prefs;
+WidgetTerminal terminal(V3);
+SemaphoreHandle_t mqttMutex = NULL;
 
-String lastAttendanceName = "-";
-String lastAttendanceNPM = "-";
-String lastAttendanceStatus = "-";
+// Forward declarations
+void mqttManagementTask(void* param);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void reconnectMQTT();
+void publishMQTT(const char* topic, const char* payload);
 
-// ═══════════════════════════════════════════════════════════════
-//                        MESH CALLBACKS
-// ═══════════════════════════════════════════════════════════════
-
-void receivedCallback(uint32_t from, String &msg) {
-  Serial.printf("[MESH] Received from %u: %s\n", from, msg.c_str());
-  
-  StaticJsonDocument<512> doc;
-  DeserializationError error = deserializeJson(doc, msg);
-  
-  if (error) {
-    Serial.println("[MESH] JSON parse failed!");
-    return;
+// MQTT Callback
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg = "";
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
   }
   
-  String msgType = doc["type"];
+  Serial.printf("[MQTT] Received from %s: %s\n", topic, msg.c_str());
   
-  if (msgType == "ATTENDANCE") {
-    // Attendance log received
-    String npm = doc["npm"];
-    String nama = doc["nama"];
-    bool success = doc["success"];
-    int rssi = doc["rssi"];
-    String node = doc["node"];
-    
-    lastAttendanceNPM = npm;
-    lastAttendanceName = nama;
-    lastAttendanceStatus = success ? "HADIR" : "FRAUD";
-    
-    // Update Blynk
-    Blynk.virtualWrite(VPIN_LAST_ATTENDANCE, 
-                       nama + " (" + npm + ") - " + lastAttendanceStatus);
-    
-    // Log to terminal
-    terminal.print("[");
-    terminal.print(node);
-    terminal.print("] ");
-    terminal.print(nama);
-    terminal.print(" (");
-    terminal.print(npm);
-    terminal.print(") - ");
-    
-    if (success) {
-      terminal.print("✓ HADIR");
-      terminal.print(" | RSSI: ");
-      terminal.println(rssi);
-      Blynk.virtualWrite(VPIN_FRAUD_ALERT, 0); // Turn off fraud LED
-    } else {
-      terminal.println("✗ FRAUD ALERT!");
-      Blynk.virtualWrite(VPIN_FRAUD_ALERT, 255); // Turn on fraud LED
-      Blynk.notify("FRAUD ALERT: " + nama + " (" + npm + ") - Phone not detected!");
+  // Topic: atlas/card (Slave sends card UID)
+  if (strcmp(topic, TOPIC_CARD_SCANNED) == 0) {
+    if (registerMode) {
+      Serial.printf("[REGISTER] Card UID received: %s\n", msg.c_str());
       
-      // Turn off fraud LED after 5 seconds
-      timer.setTimeout(5000, []() {
-        Blynk.virtualWrite(VPIN_FRAUD_ALERT, 0);
-      });
+      // Store card UID
+      pendingCardUID = msg;
+      Serial.printf("[DEBUG] Stored pendingCardUID: '%s'\n", pendingCardUID.c_str());
+      Serial.printf("[DEBUG] Current pendingNPM: '%s'\n", pendingNPM.c_str());
+      Serial.printf("[DEBUG] Current pendingServiceUUID: '%s'\n", pendingServiceUUID.c_str());
+      
+      // Check if NPM and UUID already entered
+      if (pendingNPM.length() > 0 && pendingServiceUUID.length() > 0) {
+        // Complete registration immediately
+        Serial.println("[DEBUG] All data ready, creating registration...");
+        RegistrationData reg;
+        
+        pendingCardUID.toCharArray(reg.uid, sizeof(reg.uid));
+        pendingNPM.toCharArray(reg.npm, sizeof(reg.npm));
+        pendingServiceUUID.toCharArray(reg.serviceUUID, sizeof(reg.serviceUUID));
+        
+        Serial.println("[DEBUG] RegistrationData created:");
+        Serial.printf("  reg.uid: '%s'\n", reg.uid);
+        Serial.printf("  reg.npm: '%s'\n", reg.npm);
+        Serial.printf("  reg.serviceUUID: '%s'\n", reg.serviceUUID);
+        
+        xQueueSend(registrationQueue, &reg, 0);
+        
+        pendingNPM = "";
+        pendingServiceUUID = "";
+        pendingCardUID = "";
+        waitingForCard = false;
+      } else {
+        // Store UID and wait for NPM/UUID
+        Serial.println("[REGISTER] Card stored. Waiting for NPM and UUID...");
+      }
     }
+  }
+  
+  // Topic: atlas/attendance (Slave sends uid|npm|rssi|valid)
+  else if (strcmp(topic, TOPIC_ATTENDANCE) == 0) {
+    int idx1 = msg.indexOf('|');
+    int idx2 = msg.indexOf('|', idx1 + 1);
+    int idx3 = msg.indexOf('|', idx2 + 1);
     
+    if (idx1 > 0 && idx2 > idx1 && idx3 > idx2) {
+      AttendanceData att;
+      att.uid = msg.substring(0, idx1);
+      att.npm = msg.substring(idx1 + 1, idx2);
+      att.rssi = msg.substring(idx2 + 1, idx3).toInt();
+      att.valid = (msg.substring(idx3 + 1) == "1");
+      xQueueSend(attendanceQueue, &att, 0);
+    }
+  }
+}
+
+// Blynk Callbacks
+BLYNK_WRITE(V0) {
+  registerMode = (param.asInt() == 1);
+  
+  CommandData cmd;
+  cmd.type = 0;
+  cmd.modeValue = registerMode;
+  xQueueSend(commandQueue, &cmd, 0);
+  
+  if (registerMode) {
+    Serial.println(">>> MODE: REGISTER <<<");
+    terminal.println(">>> MODE: REGISTER");
+    terminal.println("Enter NPM and UUID, then tap card");
     terminal.flush();
     
-  } else if (msgType == "NEW_REGISTRATION") {
-    // New registration notification
-    String npm = doc["npm"];
-    String nama = doc["nama"];
-    String node = doc["node"];
-    
-    regTerminal.print("[");
-    regTerminal.print(node);
-    regTerminal.print("] NEW: ");
-    regTerminal.print(nama);
-    regTerminal.print(" (");
-    regTerminal.print(npm);
-    regTerminal.println(")");
-    regTerminal.flush();
-    
-    Blynk.notify("New Registration: " + nama + " (" + npm + ")");
-    
-  } else if (msgType == "STATS") {
-    // Statistics update
-    totalStudents = doc["total_students"];
-    totalScans = doc["total_scans"];
-    successScans = doc["success_scans"];
-    fraudAttempts = doc["fraud_attempts"];
-    
-    // Update Blynk
-    Blynk.virtualWrite(VPIN_TOTAL_STUDENTS, totalStudents);
-    Blynk.virtualWrite(VPIN_TOTAL_SCANS, totalScans);
-    Blynk.virtualWrite(VPIN_SUCCESS_SCANS, successScans);
-    Blynk.virtualWrite(VPIN_FRAUD_ATTEMPTS, fraudAttempts);
-  }
-}
-
-void newConnectionCallback(uint32_t nodeId) {
-  Serial.printf("[MESH] New Connection, nodeId = %u\n", nodeId);
-  Blynk.virtualWrite(VPIN_NODE_STATUS, 255); // Turn on node connected LED
-}
-
-void changedConnectionCallback() {
-  Serial.println("[MESH] Connections changed");
-  
-  // Check if any nodes are connected
-  if (mesh.getNodeList().size() > 0) {
-    Blynk.virtualWrite(VPIN_NODE_STATUS, 255);
+    // Allow card scan anytime in register mode
+    if (pendingNPM.length() > 0 && pendingServiceUUID.length() > 0) {
+      waitingForCard = true;
+      terminal.println("Ready! Tap card now...");
+      terminal.flush();
+    }
   } else {
-    Blynk.virtualWrite(VPIN_NODE_STATUS, 0);
+    Serial.println(">>> MODE: DEFAULT <<<");
+    terminal.println(">>> MODE: DEFAULT");
+    terminal.flush();
+    waitingForCard = false;
   }
 }
 
-void nodeTimeAdjustedCallback(int32_t offset) {
-  Serial.printf("[MESH] Time adjusted. Offset = %d\n", offset);
-}
-
-// ═══════════════════════════════════════════════════════════════
-//                        BLYNK CALLBACKS
-// ═══════════════════════════════════════════════════════════════
-
-BLYNK_WRITE(VPIN_REGISTRATION_TOGGLE) {
-  registrationEnabled = param.asInt();
+BLYNK_WRITE(V1) {
+  pendingNPM = param.asStr();
+  Serial.printf("[Blynk] NPM input: %s\n", pendingNPM.c_str());
+  Serial.printf("[DEBUG] pendingCardUID: '%s'\n", pendingCardUID.c_str());
+  Serial.printf("[DEBUG] pendingServiceUUID: '%s'\n", pendingServiceUUID.c_str());
   
-  Serial.printf("[BLYNK] Registration mode: %s\n", 
-                registrationEnabled ? "ENABLED" : "DISABLED");
-  
-  // Send command to all client nodes
-  StaticJsonDocument<256> doc;
-  doc["type"] = "ENABLE_REGISTER";
-  doc["enabled"] = registrationEnabled;
-  
-  String msg;
-  serializeJson(doc, msg);
-  
-  mesh.sendBroadcast(msg);
-  
-  if (registrationEnabled) {
-    Blynk.notify("Registration mode ENABLED on all nodes");
-    regTerminal.println(">>> REGISTRATION MODE: ON");
-  } else {
-    Blynk.notify("Registration mode DISABLED");
-    regTerminal.println(">>> REGISTRATION MODE: OFF");
+  if (registerMode) {
+    // Check if we have all data (including scanned card)
+    if (pendingCardUID.length() > 0 && pendingServiceUUID.length() > 0) {
+      // Complete registration now
+      Serial.println("[DEBUG] All data ready (from NPM input), creating registration...");
+      RegistrationData reg;
+      
+      pendingCardUID.toCharArray(reg.uid, sizeof(reg.uid));
+      pendingNPM.toCharArray(reg.npm, sizeof(reg.npm));
+      pendingServiceUUID.toCharArray(reg.serviceUUID, sizeof(reg.serviceUUID));
+      
+      Serial.println("[DEBUG] RegistrationData created:");
+      Serial.printf("  reg.uid: '%s'\n", reg.uid);
+      Serial.printf("  reg.npm: '%s'\n", reg.npm);
+      Serial.printf("  reg.serviceUUID: '%s'\n", reg.serviceUUID);
+      
+      xQueueSend(registrationQueue, &reg, 0);
+      
+      pendingNPM = "";
+      pendingServiceUUID = "";
+      pendingCardUID = "";
+      waitingForCard = false;
+      
+      terminal.println("✓ Registration processing...");
+      terminal.flush();
+    } else if (pendingServiceUUID.length() > 0) {
+      waitingForCard = true;
+      terminal.println("Ready! Tap card on slave...");
+      terminal.flush();
+    }
   }
-  regTerminal.flush();
 }
 
-BLYNK_WRITE(VPIN_ATTENDANCE_LOG) {
-  // Clear terminal if command is "clear"
-  String input = param.asStr();
-  if (input == "clear") {
+BLYNK_WRITE(V2) {
+  pendingServiceUUID = param.asStr();
+  Serial.printf("[Blynk] UUID input: %s\n", pendingServiceUUID.c_str());
+  Serial.printf("[DEBUG] pendingCardUID: '%s'\n", pendingCardUID.c_str());
+  Serial.printf("[DEBUG] pendingNPM: '%s'\n", pendingNPM.c_str());
+  
+  if (registerMode) {
+    // Check if we have all data (including scanned card)
+    if (pendingCardUID.length() > 0 && pendingNPM.length() > 0) {
+      // Complete registration now
+      Serial.println("[DEBUG] All data ready (from UUID input), creating registration...");
+      RegistrationData reg;
+      
+      pendingCardUID.toCharArray(reg.uid, sizeof(reg.uid));
+      pendingNPM.toCharArray(reg.npm, sizeof(reg.npm));
+      pendingServiceUUID.toCharArray(reg.serviceUUID, sizeof(reg.serviceUUID));
+      
+      Serial.println("[DEBUG] RegistrationData created:");
+      Serial.printf("  reg.uid: '%s'\n", reg.uid);
+      Serial.printf("  reg.npm: '%s'\n", reg.npm);
+      Serial.printf("  reg.serviceUUID: '%s'\n", reg.serviceUUID);
+      
+      xQueueSend(registrationQueue, &reg, 0);
+      
+      pendingNPM = "";
+      pendingServiceUUID = "";
+      pendingCardUID = "";
+      waitingForCard = false;
+      
+      terminal.println("✓ Registration processing...");
+      terminal.flush();
+    } else if (pendingNPM.length() > 0) {
+      waitingForCard = true;
+      terminal.println("Ready! Tap card on slave...");
+      terminal.flush();
+    }
+  }
+}
+
+BLYNK_WRITE(V3) {
+  String cmd = param.asStr();
+  if (cmd == "clear" || cmd == "clr") {
     terminal.clear();
-    terminal.println("Log cleared.");
-    terminal.flush();
   }
 }
 
-BLYNK_WRITE(VPIN_REGISTRATION_LOG) {
-  // Clear terminal if command is "clear"
-  String input = param.asStr();
-  if (input == "clear") {
-    regTerminal.clear();
-    regTerminal.println("Log cleared.");
-    regTerminal.flush();
-  }
-}
-
-BLYNK_CONNECTED() {
-  Serial.println("[BLYNK] Connected to server");
-  
-  // Initial display
-  Blynk.virtualWrite(VPIN_LAST_ATTENDANCE, "Waiting for attendance...");
-  Blynk.virtualWrite(VPIN_FRAUD_ALERT, 0);
-  
-  terminal.clear();
-  terminal.println("=== ATLAS Gateway Started ===");
-  terminal.println("Waiting for attendance logs...");
-  terminal.flush();
-  
-  regTerminal.clear();
-  regTerminal.println("=== Registration Log ===");
-  regTerminal.println("Toggle switch to enable registration mode");
-  regTerminal.flush();
-}
-
-// ═══════════════════════════════════════════════════════════════
-//                        SETUP FUNCTION
-// ═══════════════════════════════════════════════════════════════
-
+// Setup
 void setup() {
   Serial.begin(115200);
-  while (!Serial);
+  delay(1000);
   
-  printHeader();
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║   ATLAS MASTER - Blynk + MQTT         ║");
+  Serial.println("║   Broker: HiveMQ                       ║");
+  Serial.println("╚════════════════════════════════════════╝\n");
   
-  // Initialize WiFi
-  Serial.println("\n[WiFi] Connecting to WiFi...");
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  
+  // WiFi
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  
   Serial.println("\n✓ WiFi connected");
-  Serial.print("  IP: ");
+  Serial.print("IP: ");
   Serial.println(WiFi.localIP());
   
-  // Initialize Blynk
-  Serial.println("\n[BLYNK] Connecting to Blynk...");
-  Blynk.config(BLYNK_AUTH);
-  Blynk.connect();
+  // MQTT
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setKeepAlive(60);
+  mqttClient.setSocketTimeout(30);
   
-  while (!Blynk.connected()) {
-    delay(500);
-    Serial.print(".");
+  reconnectMQTT();
+  
+  // Subscribe to topics
+  mqttClient.subscribe(TOPIC_CARD_SCANNED);
+  mqttClient.subscribe(TOPIC_ATTENDANCE);
+  Serial.println("✓ MQTT subscribed to topics");
+  
+  // Blynk
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  Blynk.connect();
+  Serial.println("✓ Blynk connected");
+  
+  // Preferences
+  prefs.begin("atlas_master", false);
+  attendanceCount = prefs.getInt("att_count", 0);
+  Serial.println("✓ Preferences initialized");
+  
+  // RTOS
+  attendanceQueue = xQueueCreate(10, sizeof(AttendanceData));
+  registrationQueue = xQueueCreate(5, sizeof(RegistrationData));
+  commandQueue = xQueueCreate(5, sizeof(CommandData));
+  mqttMutex = xSemaphoreCreateMutex();
+  
+  if (!attendanceQueue || !registrationQueue || !commandQueue || !mqttMutex) {
+    Serial.println("✗ RTOS init failed");
+    while(1) delay(1000);
   }
   
-  Serial.println("\n✓ Blynk connected");
+  xTaskCreatePinnedToCore(mqttManagementTask, "MQTT", 8192, NULL, 2, &mqttTaskHandle, 0);
   
-  // Initialize Mesh
-  Serial.println("\n[MESH] Initializing Mesh Network...");
-  mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
-  mesh.init(MESH_PREFIX, MESH_PASSWORD, MESH_PORT);
-  mesh.onReceive(&receivedCallback);
-  mesh.onNewConnection(&newConnectionCallback);
-  mesh.onChangedConnections(&changedConnectionCallback);
-  mesh.onNodeTimeAdjusted(&nodeTimeAdjustedCallback);
+  Serial.println("✓ RTOS tasks created\n");
+  Serial.println(">>> MODE: DEFAULT <<<");
+  Serial.println("Ready.\n");
   
-  Serial.println("✓ Mesh Network initialized");
-  Serial.printf("  Node ID: %u\n", mesh.getNodeId());
-  
-  // Setup timer
-  timer.setInterval(1000L, []() {
-    // Keep Blynk alive
-  });
-  
-  Serial.println("\n[SYSTEM] Gateway Ready!");
-  Serial.println("  - Monitoring mesh network");
-  Serial.println("  - Connected to Blynk dashboard");
-  Serial.println("  - Ready to receive attendance logs\n");
+  Blynk.virtualWrite(V4, attendanceCount);
+  terminal.println("System Ready");
+  terminal.flush();
 }
-
-// ═══════════════════════════════════════════════════════════════
-//                        MAIN LOOP
-// ═══════════════════════════════════════════════════════════════
 
 void loop() {
-  mesh.update();
-  Blynk.run();
-  timer.run();
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
-// ═══════════════════════════════════════════════════════════════
-//                      UTILITY FUNCTIONS
-// ═══════════════════════════════════════════════════════════════
-
-void printHeader() {
-  Serial.println("\n╔════════════════════════════════════════════════════════╗");
-  Serial.println("║           PROJECT ATLAS - GATEWAY NODE                ║");
-  Serial.println("║              Rangkaian B (Meja Dosen)                  ║");
-  Serial.println("╚════════════════════════════════════════════════════════╝\n");
+// MQTT Helper Functions
+void reconnectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to MQTT...");
+    if (mqttClient.connect(mqtt_client_id)) {
+      Serial.println(" connected!");
+      Serial.printf("Broker: %s:%d\n", mqtt_server, mqtt_port);
+    } else {
+      Serial.printf(" failed, rc=%d. Retry in 5s\n", mqttClient.state());
+      delay(5000);
+    }
+  }
 }
-```
 
----
+void publishMQTT(const char* topic, const char* payload) {
+  if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    if (mqttClient.connected()) {
+      mqttClient.publish(topic, payload);
+      Serial.printf("[MQTT] Published to %s: %s\n", topic, payload);
+    } else {
+      Serial.println("[MQTT] Not connected, reconnecting...");
+      reconnectMQTT();
+    }
+    xSemaphoreGive(mqttMutex);
+  }
+}
 
-## **SETUP BLYNK DASHBOARD:**
-
-### **1. Buat Project Baru di Blynk:**
-- Download **Blynk IoT** app (Android/iOS)
-- Create new template
-- Copy **Auth Token**
-
-### **2. Tambahkan Widgets:**
-
-**Virtual Pin V0 - Switch:**
-- Name: "Registration Mode"
-- Mode: Switch
-- DataStream: V0
-
-**Virtual Pin V1 - Label:**
-- Name: "Last Attendance"
-- DataStream: V1
-
-**Virtual Pin V2 - LED:**
-- Name: "Fraud Alert"
-- Color: Red
-- DataStream: V2
-
-**Virtual Pin V3-V6 - Value Display:**
-- V3: "Total Students"
-- V4: "Total Scans"
-- V5: "Success"
-- V6: "Fraud Attempts"
-
-**Virtual Pin V7 - Terminal:**
-- Name: "Attendance Log"
-- DataStream: V7
-
-**Virtual Pin V8 - Terminal:**
-- Name: "Registration Log"
-- DataStream: V8
-
-**Virtual Pin V9 - LED:**
-- Name: "Node Connected"
-- Color: Green
-- DataStream: V9
-
----
-
-## **LIBRARY YANG DIPERLUKAN:**
-
-**Rangkaian A:**
-```
-- MFRC522
-- Adafruit GFX
-- Adafruit SSD1306
-- painlessMesh
-- ArduinoJson
-```
-
-**Rangkaian B:**
-```
-- painlessMesh
-- ArduinoJson
-- Blynk (legacy or new)
+// RTOS Task
+void mqttManagementTask(void* param) {
+  Serial.println("[Task] MQTT+Blynk started on core 0");
+  
+  AttendanceData att;
+  RegistrationData reg;
+  CommandData cmd;
+  
+  while (1) {
+    // MQTT loop
+    if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      if (!mqttClient.connected()) {
+        reconnectMQTT();
+        mqttClient.subscribe(TOPIC_CARD_SCANNED);
+        mqttClient.subscribe(TOPIC_ATTENDANCE);
+      }
+      mqttClient.loop();
+      xSemaphoreGive(mqttMutex);
+    }
+    
+    // Run Blynk
+    Blynk.run();
+    
+    // Process commands (MQTT publish)
+    if (xQueueReceive(commandQueue, &cmd, 0) == pdPASS) {
+      if (cmd.type == 0) {
+        // Send mode signal
+        const char* mode = cmd.modeValue ? "register" : "default";
+        publishMQTT(TOPIC_MODE, mode);
+        Serial.printf("[MQTT] Mode signal sent: %s\n", mode);
+      } else if (cmd.type == 1) {
+        // Send registration data
+        Serial.println("[DEBUG] Preparing registration MQTT message:");
+        Serial.printf("  cmd.uid: '%s' (len=%d)\n", cmd.uid, strlen(cmd.uid));
+        Serial.printf("  cmd.npm: '%s' (len=%d)\n", cmd.npm, strlen(cmd.npm));
+        Serial.printf("  cmd.serviceUUID: '%s' (len=%d)\n", cmd.serviceUUID, strlen(cmd.serviceUUID));
+        
+        char payload[200];
+        snprintf(payload, sizeof(payload), "%s|%s|%s", 
+                 cmd.uid, cmd.npm, cmd.serviceUUID);
+        
+        Serial.printf("[DEBUG] Formatted payload: '%s' (len=%d)\n", payload, strlen(payload));
+        publishMQTT(TOPIC_REGISTER_DATA, payload);
+        Serial.println("[MQTT] Registration data sent");
+      }
+    }
+    
+    // Process attendance
+    if (xQueueReceive(attendanceQueue, &att, 0) == pdPASS) {
+      if (att.valid) {
+        attendanceCount++;
+        prefs.putInt("att_count", attendanceCount);
+        
+        Serial.printf("✓ Attendance #%d: %s (RSSI: %d)\n", 
+                      attendanceCount, att.npm.c_str(), att.rssi);
+        
+        Blynk.virtualWrite(V4, attendanceCount);
+        Blynk.virtualWrite(V5, att.npm + " - ✓ Valid");
+        
+        String log = "✓ #" + String(attendanceCount) + ": " + att.npm + 
+                     " (RSSI:" + String(att.rssi) + ")";
+        terminal.println(log);
+        terminal.flush();
+      } else {
+        Serial.printf("✗ Invalid: %s\n", att.uid.c_str());
+        
+        Blynk.virtualWrite(V5, att.uid + " - ✗ Invalid (BLE mismatch)");
+        terminal.println("✗ Invalid: " + att.uid + " (BLE mismatch)");
+        terminal.flush();
+      }
+    }
+    
+    // Process registration
+    if (xQueueReceive(registrationQueue, &reg, 0) == pdPASS) {
+      Serial.println("\n[REGISTER] Processing:");
+      Serial.printf("  UID : %s\n", reg.uid);
+      Serial.printf("  NPM : %s\n", reg.npm);
+      Serial.printf("  UUID: %s\n", reg.serviceUUID);
+      
+      // Store locally
+      String safeKey = String(reg.uid);
+      safeKey.replace(" ", "");
+      String value = String(reg.npm) + "|" + String(reg.serviceUUID);
+      prefs.putString(safeKey.c_str(), value);
+      
+      // Send to slave: uid|npm|serviceUUID
+      CommandData regCmd;
+      regCmd.type = 1;
+      strncpy(regCmd.uid, reg.uid, sizeof(regCmd.uid) - 1);
+      regCmd.uid[sizeof(regCmd.uid) - 1] = '\0';
+      strncpy(regCmd.npm, reg.npm, sizeof(regCmd.npm) - 1);
+      regCmd.npm[sizeof(regCmd.npm) - 1] = '\0';
+      strncpy(regCmd.serviceUUID, reg.serviceUUID, sizeof(regCmd.serviceUUID) - 1);
+      regCmd.serviceUUID[sizeof(regCmd.serviceUUID) - 1] = '\0';
+      
+      Serial.println("[DEBUG] Before queue send:");
+      Serial.printf("  regCmd.uid: '%s'\n", regCmd.uid);
+      Serial.printf("  regCmd.npm: '%s'\n", regCmd.npm);
+      Serial.printf("  regCmd.serviceUUID: '%s'\n", regCmd.serviceUUID);
+      
+      xQueueSend(commandQueue, &regCmd, 0);
+      
+      Serial.println("✓ Registration complete\n");
+      
+      Blynk.virtualWrite(V5, "Registered: " + String(reg.npm));
+      terminal.println("✓ Registered: " + String(reg.npm));
+      terminal.println("  UID: " + String(reg.uid));
+      terminal.flush();
+      
+      // Exit register mode
+      registerMode = false;
+      waitingForCard = false;
+      Blynk.virtualWrite(V0, 0);
+      
+      CommandData modeCmd;
+      modeCmd.type = 0;
+      modeCmd.modeValue = false;
+      xQueueSend(commandQueue, &modeCmd, 0);
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}

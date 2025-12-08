@@ -7,10 +7,11 @@
 #include <PubSubClient.h>
 #include <BlynkSimpleEsp32.h>
 #include <Preferences.h>
+#include <map>
 
 // WiFi
-const char* ssid = "CALNATH";
-const char* password = "Calvin2304";
+const char* ssid = "calvin";
+const char* password = "calvin2304";
 
 // MQTT HiveMQ Broker
 const char* mqtt_server = "broker.hivemq.com";
@@ -27,9 +28,28 @@ const char* mqtt_client_id = "ATLAS_Master_001";
 volatile bool registerMode = false;
 String pendingNPM = "";
 String pendingServiceUUID = "";
-String pendingCardUID = "";  // Store scanned UID until NPM/UUID ready
+String pendingCardUID = "";
 volatile bool waitingForCard = false;
 int attendanceCount = 0;
+int inClassCount = 0;
+
+// Student tracking
+struct StudentStatus {
+  String npm;
+  String lastStatus;
+  String lastTime;
+  unsigned long enterMillis;
+};
+std::map<String, StudentStatus> activeStudents;
+
+// Invalid attempts tracking
+struct InvalidAttempt {
+  String time;
+  String uid;
+  String reason;
+};
+InvalidAttempt invalidLog[5];
+int invalidIndex = 0;
 
 // RTOS
 TaskHandle_t mqttTaskHandle = NULL;
@@ -42,6 +62,9 @@ struct AttendanceData {
   String npm;
   int rssi;
   bool valid;
+  String timestamp;
+  int scanNum;
+  String status;
 };
 
 struct RegistrationData {
@@ -63,6 +86,8 @@ WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 Preferences prefs;
 WidgetTerminal terminal(V3);
+WidgetTerminal invalidTerminal(V7);
+WidgetTerminal studentList(V8);
 SemaphoreHandle_t mqttMutex = NULL;
 
 // Forward declarations
@@ -70,6 +95,8 @@ void mqttManagementTask(void* param);
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void reconnectMQTT();
 void publishMQTT(const char* topic, const char* payload);
+String calculateDuration(unsigned long startMillis);
+void updateStudentList();
 
 // MQTT Callback
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -78,59 +105,42 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     msg += (char)payload[i];
   }
   
-  Serial.printf("[MQTT] Received from %s: %s\n", topic, msg.c_str());
-  
-  // Topic: atlas/card (Slave sends card UID)
   if (strcmp(topic, TOPIC_CARD_SCANNED) == 0) {
     if (registerMode) {
-      Serial.printf("[REGISTER] Card UID received: %s\n", msg.c_str());
-      
-      // Store card UID
       pendingCardUID = msg;
-      Serial.printf("[DEBUG] Stored pendingCardUID: '%s'\n", pendingCardUID.c_str());
-      Serial.printf("[DEBUG] Current pendingNPM: '%s'\n", pendingNPM.c_str());
-      Serial.printf("[DEBUG] Current pendingServiceUUID: '%s'\n", pendingServiceUUID.c_str());
       
-      // Check if NPM and UUID already entered
       if (pendingNPM.length() > 0 && pendingServiceUUID.length() > 0) {
-        // Complete registration immediately
-        Serial.println("[DEBUG] All data ready, creating registration...");
         RegistrationData reg;
-        
         pendingCardUID.toCharArray(reg.uid, sizeof(reg.uid));
         pendingNPM.toCharArray(reg.npm, sizeof(reg.npm));
         pendingServiceUUID.toCharArray(reg.serviceUUID, sizeof(reg.serviceUUID));
-        
-        Serial.println("[DEBUG] RegistrationData created:");
-        Serial.printf("  reg.uid: '%s'\n", reg.uid);
-        Serial.printf("  reg.npm: '%s'\n", reg.npm);
-        Serial.printf("  reg.serviceUUID: '%s'\n", reg.serviceUUID);
-        
         xQueueSend(registrationQueue, &reg, 0);
         
         pendingNPM = "";
         pendingServiceUUID = "";
         pendingCardUID = "";
         waitingForCard = false;
-      } else {
-        // Store UID and wait for NPM/UUID
-        Serial.println("[REGISTER] Card stored. Waiting for NPM and UUID...");
       }
     }
   }
-  
-  // Topic: atlas/attendance (Slave sends uid|npm|rssi|valid)
   else if (strcmp(topic, TOPIC_ATTENDANCE) == 0) {
+    // Format: uid|npm|rssi|valid|timestamp|scanNum|status (7 fields, 6 pipes)
     int idx1 = msg.indexOf('|');
     int idx2 = msg.indexOf('|', idx1 + 1);
     int idx3 = msg.indexOf('|', idx2 + 1);
+    int idx4 = msg.indexOf('|', idx3 + 1);
+    int idx5 = msg.indexOf('|', idx4 + 1);
+    int idx6 = msg.indexOf('|', idx5 + 1);
     
-    if (idx1 > 0 && idx2 > idx1 && idx3 > idx2) {
+    if (idx1 > 0 && idx6 > 0) {
       AttendanceData att;
       att.uid = msg.substring(0, idx1);
       att.npm = msg.substring(idx1 + 1, idx2);
       att.rssi = msg.substring(idx2 + 1, idx3).toInt();
-      att.valid = (msg.substring(idx3 + 1) == "1");
+      att.valid = (msg.substring(idx3 + 1, idx4) == "1");
+      att.timestamp = msg.substring(idx4 + 1, idx5);
+      att.scanNum = msg.substring(idx5 + 1, idx6).toInt();
+      att.status = msg.substring(idx6 + 1);
       xQueueSend(attendanceQueue, &att, 0);
     }
   }
@@ -145,63 +155,42 @@ BLYNK_WRITE(V0) {
   cmd.modeValue = registerMode;
   xQueueSend(commandQueue, &cmd, 0);
   
-  if (registerMode) {
-    Serial.println(">>> MODE: REGISTER <<<");
-    terminal.println(">>> MODE: REGISTER");
-    terminal.println("Enter NPM and UUID, then tap card");
-    terminal.flush();
-    
-    // Allow card scan anytime in register mode
-    if (pendingNPM.lenght() > 0) pendingServiceUUID.length() = "00000000-0000-0000-0000-00" + string(pendingNPM.length());
-    if (pendingNPM.length() > 0 && pendingServiceUUID.length() > 0) {
-      waitingForCard = true;
-      terminal.println("Ready! Tap card now...");
-      terminal.flush();
-    }
-  } else {
-    Serial.println(">>> MODE: DEFAULT <<<");
-    terminal.println(">>> MODE: DEFAULT");
-    terminal.flush();
-    waitingForCard = false;
-  }
+  terminal.println(registerMode ? ">>> REGISTER MODE" : ">>> DEFAULT MODE");
+  if (registerMode) terminal.println("Enter NPM, then tap card");
+  terminal.flush();
+  
+  if (!registerMode) waitingForCard = false;
 }
 
 BLYNK_WRITE(V1) {
   pendingNPM = param.asStr();
-  Serial.printf("[Blynk] NPM input: %s\n", pendingNPM.c_str());
-  Serial.printf("[DEBUG] pendingCardUID: '%s'\n", pendingCardUID.c_str());
-  Serial.printf("[DEBUG] pendingServiceUUID: '%s'\n", pendingServiceUUID.c_str());
   
-  if (registerMode) {
-    // Check if we have all data (including scanned card)
-    if (pendingCardUID.length() > 0 && pendingServiceUUID.length() > 0) {
-      // Complete registration now
-      Serial.println("[DEBUG] All data ready (from NPM input), creating registration...");
-      RegistrationData reg;
-      
-      pendingCardUID.toCharArray(reg.uid, sizeof(reg.uid));
-      pendingNPM.toCharArray(reg.npm, sizeof(reg.npm));
-      pendingServiceUUID.toCharArray(reg.serviceUUID, sizeof(reg.serviceUUID));
-      
-      Serial.println("[DEBUG] RegistrationData created:");
-      Serial.printf("  reg.uid: '%s'\n", reg.uid);
-      Serial.printf("  reg.npm: '%s'\n", reg.npm);
-      Serial.printf("  reg.serviceUUID: '%s'\n", reg.serviceUUID);
-      
-      xQueueSend(registrationQueue, &reg, 0);
-      
-      pendingNPM = "";
-      pendingServiceUUID = "";
-      pendingCardUID = "";
-      waitingForCard = false;
-      
-      terminal.println("✓ Registration processing...");
-      terminal.flush();
-    } else if (pendingServiceUUID.length() > 0) {
-      waitingForCard = true;
-      terminal.println("Ready! Tap card on slave...");
-      terminal.flush();
+  if (pendingNPM.length() > 0) {
+    String paddedNPM = pendingNPM;
+    while (paddedNPM.length() < 12) {
+      paddedNPM = "0" + paddedNPM;
     }
+    pendingServiceUUID = "00000000-0000-0000-0000-" + paddedNPM;
+  }
+  
+  if (registerMode && pendingCardUID.length() > 0 && pendingServiceUUID.length() > 0) {
+    RegistrationData reg;
+    pendingCardUID.toCharArray(reg.uid, sizeof(reg.uid));
+    pendingNPM.toCharArray(reg.npm, sizeof(reg.npm));
+    pendingServiceUUID.toCharArray(reg.serviceUUID, sizeof(reg.serviceUUID));
+    xQueueSend(registrationQueue, &reg, 0);
+    
+    pendingNPM = "";
+    pendingServiceUUID = "";
+    pendingCardUID = "";
+    waitingForCard = false;
+    
+    terminal.println("✓ Registration processing...");
+    terminal.flush();
+  } else if (pendingServiceUUID.length() > 0) {
+    waitingForCard = true;
+    terminal.println("Ready! Tap card on slave...");
+    terminal.flush();
   }
 }
 
@@ -212,49 +201,66 @@ BLYNK_WRITE(V3) {
   }
 }
 
+BLYNK_WRITE(V9) {
+  if (param.asInt() == 1) {
+    attendanceCount = 0;
+    prefs.putInt("att_count", 0);
+    Blynk.virtualWrite(V4, 0);
+    terminal.println("✓ Counter cleared");
+    terminal.flush();
+  }
+}
+
+BLYNK_WRITE(V10) {
+  if (param.asInt() == 1) {
+    prefs.clear();
+    activeStudents.clear();
+    inClassCount = 0;
+    attendanceCount = 0;
+    
+    studentList.clear();
+    studentList.println("Database cleared");
+    studentList.flush();
+    
+    terminal.println("✓ Database cleared");
+    terminal.flush();
+    
+    Blynk.virtualWrite(V4, 0);
+    Blynk.virtualWrite(V6, 0);
+    
+    publishMQTT("atlas/command", "clear_all");
+  }
+}
+
 // Setup
 void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  Serial.println("\n╔════════════════════════════════════════╗");
-  Serial.println("║   ATLAS MASTER - Blynk + MQTT         ║");
-  Serial.println("║   Broker: HiveMQ                       ║");
-  Serial.println("╚════════════════════════════════════════╝\n");
+  Serial.println("\n=== ATLAS MASTER - Blynk + MQTT ===\n");
   
   // WiFi
-  Serial.print("Connecting to WiFi");
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
   Serial.println("\n✓ WiFi connected");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
   
   // MQTT
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setKeepAlive(60);
-  mqttClient.setSocketTimeout(30);
-  
   reconnectMQTT();
-  
-  // Subscribe to topics
   mqttClient.subscribe(TOPIC_CARD_SCANNED);
   mqttClient.subscribe(TOPIC_ATTENDANCE);
-  Serial.println("✓ MQTT subscribed to topics");
   
   // Blynk
   Blynk.config(BLYNK_AUTH_TOKEN);
   Blynk.connect();
-  Serial.println("✓ Blynk connected");
   
   // Preferences
   prefs.begin("atlas_master", false);
   attendanceCount = prefs.getInt("att_count", 0);
-  Serial.println("✓ Preferences initialized");
   
   // RTOS
   attendanceQueue = xQueueCreate(10, sizeof(AttendanceData));
@@ -262,20 +268,22 @@ void setup() {
   commandQueue = xQueueCreate(5, sizeof(CommandData));
   mqttMutex = xSemaphoreCreateMutex();
   
-  if (!attendanceQueue || !registrationQueue || !commandQueue || !mqttMutex) {
-    Serial.println("✗ RTOS init failed");
-    while(1) delay(1000);
-  }
-  
   xTaskCreatePinnedToCore(mqttManagementTask, "MQTT", 8192, NULL, 2, &mqttTaskHandle, 0);
   
-  Serial.println("✓ RTOS tasks created\n");
-  Serial.println(">>> MODE: DEFAULT <<<");
-  Serial.println("Ready.\n");
+  Serial.println("✓ Ready\n");
   
   Blynk.virtualWrite(V4, attendanceCount);
+  Blynk.virtualWrite(V6, inClassCount);
+  Blynk.virtualWrite(V11, "0m");
+  
   terminal.println("System Ready");
   terminal.flush();
+  
+  invalidTerminal.println("No invalid attempts yet");
+  invalidTerminal.flush();
+  
+  studentList.println("No students in class");
+  studentList.flush();
 }
 
 void loop() {
@@ -298,21 +306,48 @@ void reconnectMQTT() {
 
 void publishMQTT(const char* topic, const char* payload) {
   if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-    if (mqttClient.connected()) {
-      mqttClient.publish(topic, payload);
-      Serial.printf("[MQTT] Published to %s: %s\n", topic, payload);
-    } else {
-      Serial.println("[MQTT] Not connected, reconnecting...");
-      reconnectMQTT();
-    }
+    if (!mqttClient.connected()) reconnectMQTT();
+    mqttClient.publish(topic, payload);
     xSemaphoreGive(mqttMutex);
   }
 }
 
+String calculateDuration(unsigned long startMillis) {
+  if (startMillis == 0) return "-";
+  unsigned long duration = millis() - startMillis;
+  unsigned long hours = duration / 3600000;
+  unsigned long minutes = (duration % 3600000) / 60000;
+  
+  if (hours > 0) {
+    return String(hours) + "h " + String(minutes) + "m";
+  } else {
+    return String(minutes) + "m";
+  }
+}
+
+void updateStudentList() {
+  studentList.clear();
+  
+  if (activeStudents.empty()) {
+    studentList.println("No students in class");
+  } else {
+    for (auto& pair : activeStudents) {
+      StudentStatus& s = pair.second;
+      String icon = (s.lastStatus == "MASUK") ? "✓" : "✗";
+      String dur = (s.lastStatus == "MASUK") ? calculateDuration(s.enterMillis) : "-";
+      
+      studentList.print(icon + " " + s.npm + " | ");
+      studentList.print(s.lastStatus + " | ");
+      studentList.print(s.lastTime + " | ");
+      studentList.println(dur);
+    }
+  }
+  
+  studentList.flush();
+}
+
 // RTOS Task
 void mqttManagementTask(void* param) {
-  Serial.println("[Task] MQTT+Blynk started on core 0");
-  
   AttendanceData att;
   RegistrationData reg;
   CommandData cmd;
@@ -329,30 +364,16 @@ void mqttManagementTask(void* param) {
       xSemaphoreGive(mqttMutex);
     }
     
-    // Run Blynk
     Blynk.run();
     
-    // Process commands (MQTT publish)
+    // Process commands
     if (xQueueReceive(commandQueue, &cmd, 0) == pdPASS) {
       if (cmd.type == 0) {
-        // Send mode signal
-        const char* mode = cmd.modeValue ? "register" : "default";
-        publishMQTT(TOPIC_MODE, mode);
-        Serial.printf("[MQTT] Mode signal sent: %s\n", mode);
+        publishMQTT(TOPIC_MODE, cmd.modeValue ? "register" : "default");
       } else if (cmd.type == 1) {
-        // Send registration data
-        Serial.println("[DEBUG] Preparing registration MQTT message:");
-        Serial.printf("  cmd.uid: '%s' (len=%d)\n", cmd.uid, strlen(cmd.uid));
-        Serial.printf("  cmd.npm: '%s' (len=%d)\n", cmd.npm, strlen(cmd.npm));
-        Serial.printf("  cmd.serviceUUID: '%s' (len=%d)\n", cmd.serviceUUID, strlen(cmd.serviceUUID));
-        
         char payload[200];
-        snprintf(payload, sizeof(payload), "%s|%s|%s", 
-                 cmd.uid, cmd.npm, cmd.serviceUUID);
-        
-        Serial.printf("[DEBUG] Formatted payload: '%s' (len=%d)\n", payload, strlen(payload));
+        snprintf(payload, sizeof(payload), "%s|%s|%s", cmd.uid, cmd.npm, cmd.serviceUUID);
         publishMQTT(TOPIC_REGISTER_DATA, payload);
-        Serial.println("[MQTT] Registration data sent");
       }
     }
     
@@ -362,63 +383,102 @@ void mqttManagementTask(void* param) {
         attendanceCount++;
         prefs.putInt("att_count", attendanceCount);
         
-        Serial.printf("✓ Attendance #%d: %s (RSSI: %d)\n", 
-                      attendanceCount, att.npm.c_str(), att.rssi);
+        // Update in-class count
+        if (att.status == "MASUK") {
+          inClassCount++;
+        } else if (att.status == "KELUAR" && inClassCount > 0) {
+          inClassCount--;
+        }
+        
+        // Update student tracking
+        StudentStatus& student = activeStudents[att.npm];
+        student.npm = att.npm;
+        student.lastStatus = att.status;
+        student.lastTime = att.timestamp.substring(11, 19);
+        
+        if (att.status == "MASUK") {
+          student.enterMillis = millis();
+        } else {
+          student.enterMillis = 0;
+        }
+        
+        // Calculate average duration
+        unsigned long totalDuration = 0;
+        int activeCount = 0;
+        for (auto& pair : activeStudents) {
+          if (pair.second.lastStatus == "MASUK" && pair.second.enterMillis > 0) {
+            totalDuration += (millis() - pair.second.enterMillis);
+            activeCount++;
+          }
+        }
+        String avgDur = activeCount > 0 ? calculateDuration(millis() - (totalDuration / activeCount)) : "0m";
+        
+        Serial.printf("✓ #%d [%s] %s | %s | RSSI:%d\n", 
+                      att.scanNum, att.status.c_str(), att.npm.c_str(), 
+                      att.timestamp.c_str(), att.rssi);
         
         Blynk.virtualWrite(V4, attendanceCount);
-        Blynk.virtualWrite(V5, att.npm + " - ✓ Valid");
+        Blynk.virtualWrite(V5, att.npm + " - ✓ " + att.status);
+        Blynk.virtualWrite(V6, inClassCount);
+        Blynk.virtualWrite(V11, avgDur);
         
-        String log = "✓ #" + String(attendanceCount) + ": " + att.npm + 
-                     " (RSSI:" + String(att.rssi) + ")";
+        String log = "✓ #" + String(att.scanNum) + " [" + att.status + "] " + 
+                     att.npm + " | " + att.timestamp;
         terminal.println(log);
         terminal.flush();
-      } else {
-        Serial.printf("✗ Invalid: %s\n", att.uid.c_str());
         
-        Blynk.virtualWrite(V5, att.uid + " - ✗ Invalid (BLE mismatch)");
-        terminal.println("✗ Invalid: " + att.uid + " (BLE mismatch)");
+        updateStudentList();
+        
+      } else {
+        // Invalid attempt
+        String timeOnly = att.timestamp.substring(11, 19);
+        String reason = "BLE mismatch";
+        
+        invalidLog[invalidIndex].time = timeOnly;
+        invalidLog[invalidIndex].uid = att.uid;
+        invalidLog[invalidIndex].reason = reason;
+        invalidIndex = (invalidIndex + 1) % 5;
+        
+        invalidTerminal.clear();
+        for (int i = 0; i < 5; i++) {
+          int idx = (invalidIndex + i) % 5;
+          if (invalidLog[idx].time.length() > 0) {
+            invalidTerminal.println("✗ " + invalidLog[idx].time + " - " + 
+                                   invalidLog[idx].uid + " (" + 
+                                   invalidLog[idx].reason + ")");
+          }
+        }
+        invalidTerminal.flush();
+        
+        Blynk.virtualWrite(V5, att.uid + " - ✗ Invalid");
+        terminal.println("✗ Invalid: " + att.uid);
         terminal.flush();
       }
     }
     
     // Process registration
     if (xQueueReceive(registrationQueue, &reg, 0) == pdPASS) {
-      Serial.println("\n[REGISTER] Processing:");
-      Serial.printf("  UID : %s\n", reg.uid);
-      Serial.printf("  NPM : %s\n", reg.npm);
-      Serial.printf("  UUID: %s\n", reg.serviceUUID);
-      
-      // Store locally
       String safeKey = String(reg.uid);
       safeKey.replace(" ", "");
       String value = String(reg.npm) + "|" + String(reg.serviceUUID);
       prefs.putString(safeKey.c_str(), value);
       
-      // Send to slave: uid|npm|serviceUUID
       CommandData regCmd;
       regCmd.type = 1;
       strncpy(regCmd.uid, reg.uid, sizeof(regCmd.uid) - 1);
-      regCmd.uid[sizeof(regCmd.uid) - 1] = '\0';
       strncpy(regCmd.npm, reg.npm, sizeof(regCmd.npm) - 1);
-      regCmd.npm[sizeof(regCmd.npm) - 1] = '\0';
       strncpy(regCmd.serviceUUID, reg.serviceUUID, sizeof(regCmd.serviceUUID) - 1);
+      regCmd.uid[sizeof(regCmd.uid) - 1] = '\0';
+      regCmd.npm[sizeof(regCmd.npm) - 1] = '\0';
       regCmd.serviceUUID[sizeof(regCmd.serviceUUID) - 1] = '\0';
-      
-      Serial.println("[DEBUG] Before queue send:");
-      Serial.printf("  regCmd.uid: '%s'\n", regCmd.uid);
-      Serial.printf("  regCmd.npm: '%s'\n", regCmd.npm);
-      Serial.printf("  regCmd.serviceUUID: '%s'\n", regCmd.serviceUUID);
-      
       xQueueSend(commandQueue, &regCmd, 0);
       
-      Serial.println("✓ Registration complete\n");
+      Serial.printf("✓ Registered: %s -> %s\n", reg.uid, reg.npm);
       
       Blynk.virtualWrite(V5, "Registered: " + String(reg.npm));
       terminal.println("✓ Registered: " + String(reg.npm));
-      terminal.println("  UID: " + String(reg.uid));
       terminal.flush();
       
-      // Exit register mode
       registerMode = false;
       waitingForCard = false;
       Blynk.virtualWrite(V0, 0);

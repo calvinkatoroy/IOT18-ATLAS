@@ -1,904 +1,453 @@
 /*
- * ═══════════════════════════════════════════════════════════════
- *              PROJECT ATLAS - RANGKAIAN A (CLIENT NODE)
- *                    Node Pintu Kelas dengan Mesh
- * ═══════════════════════════════════════════════════════════════
+ * ATLAS SLAVE - MQTT RFID + BLE Validator
+ * Mode: 
+ *   - DEFAULT: Scan RFID -> Validate BLE UUID -> Send to Master
+ *   - REGISTER: Wait master signal -> Scan card -> Send UID to Master
  * 
- * Hardware:
- * - ESP32 DevKit V1
- * - MFRC522 RFID Reader
- * - SSD1306 OLED Display (128x64)
- * - Active Buzzer
- * - LED (Green/Red)
- * 
- * Features:
- * - RFID Attendance & Registration
- * - BLE Beacon Scanning (Anti-cheat)
- * - Local Database (Preferences.h)
- * - Mesh Network Communication
- * - No WiFi Connection (Only Mesh)
- * - Remote Registration Control from Gateway
- * 
- * ═══════════════════════════════════════════════════════════════
+ * Architecture: FreeRTOS with tasks, queues, and mutexes
+ * Broker: HiveMQ
  */
 
+#include <Arduino.h>
 #include <SPI.h>
-#include <Wire.h>
 #include <MFRC522.h>
-#include <BLEDevice.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
 #include <Preferences.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <painlessMesh.h>
-#include <ArduinoJson.h>
-#include <vector>
+#include <NimBLEDevice.h>
+#include <NimBLEScan.h>
+#include <NimBLEAdvertisedDevice.h>
 
-// ═══════════════════════════════════════════════════════════════
-//                        PIN DEFINITIONS
-// ═══════════════════════════════════════════════════════════════
+// ======================== PIN CONFIGURATION ========================
+#define SS_PIN    21
+#define RST_PIN   22
+#define SCK_PIN   18
+#define MOSI_PIN  23
+#define MISO_PIN  19
 
-// RFID Pins
-#define SS_PIN      21
-#define RST_PIN     22
-#define SCK_PIN     18
-#define MOSI_PIN    23
-#define MISO_PIN    19
+// ======================== WIFI CONFIG ========================
+const char* ssid = "CALNATH";
+const char* password = "Calvin2304";
 
-// Output Pins
-#define LED_GREEN   2
-#define LED_RED     4
-#define BUZZER      5
+// ======================== MQTT CONFIG ========================
+const char* mqtt_server = "broker.hivemq.com";
+const int mqtt_port = 1883;
+const char* mqtt_client_id = "ATLAS_Slave_001";
 
-// I2C Pins (OLED)
-#define SDA_PIN     21
-#define SCL_PIN     22
+// MQTT Topics
+#define TOPIC_MODE           "atlas/mode"          // Master -> Slave: register/default
+#define TOPIC_REGISTER_DATA  "atlas/register"      // Master -> Slave: uid|npm|uuid
+#define TOPIC_CARD_SCANNED   "atlas/card"          // Slave -> Master: card UID
+#define TOPIC_ATTENDANCE     "atlas/attendance"    // Slave -> Master: uid|npm|rssi|valid
 
-// OLED Config
-#define SCREEN_WIDTH  128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET    -1
-#define OLED_ADDRESS  0x3C
+// ======================== BLE CONFIG ========================
+#define BLE_SCAN_TIME 3
+#define RSSI_THRESHOLD -80
 
-// ═══════════════════════════════════════════════════════════════
-//                        MESH CONFIGURATION
-// ═══════════════════════════════════════════════════════════════
-
-#define MESH_PREFIX     "ATLAS_MESH"
-#define MESH_PASSWORD   "atlas2024"
-#define MESH_PORT       5555
-
-// ═══════════════════════════════════════════════════════════════
-//                        CONFIGURATION
-// ═══════════════════════════════════════════════════════════════
-
-#define BLE_SCAN_TIME       5
-#define BLE_SCAN_QUICK      3
-#define RSSI_THRESHOLD      -75
-#define NODE_NAME          "CLIENT_NODE_1"
-
-const char* PREF_NAMESPACE = "atlas_db";
-
-// ═══════════════════════════════════════════════════════════════
-//                        GLOBAL OBJECTS
-// ═══════════════════════════════════════════════════════════════
-
+// ======================== OBJECTS ========================
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 MFRC522 mfrc522(SS_PIN, RST_PIN);
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-BLEScan* pBLEScan;
-Preferences preferences;
-painlessMesh mesh;
+Preferences prefs;
+NimBLEScan* pBLEScan;
 
-// ═══════════════════════════════════════════════════════════════
-//                        DATA STRUCTURES
-// ═══════════════════════════════════════════════════════════════
+// ======================== GLOBAL STATE ========================
+volatile bool registerMode = false;
+String detectedBLEUUID = "";
+int detectedBLERSSI = -100;
 
-struct BLEDeviceInfo {
-  String uuid;
-  String name;
-  int rssi;
+// ======================== RTOS HANDLES ========================
+TaskHandle_t rfidTaskHandle = NULL;
+TaskHandle_t validationTaskHandle = NULL;
+TaskHandle_t mqttTaskHandle = NULL;
+QueueHandle_t cardQueue = NULL;
+SemaphoreHandle_t prefsMutex = NULL;
+SemaphoreHandle_t bleMutex = NULL;
+SemaphoreHandle_t mqttMutex = NULL;
+
+// ======================== STRUCTURES ========================
+struct CardData {
+  String uid;
+  String safeKey;  // UID without spaces
 };
 
-enum SystemState {
-  STATE_STANDBY,
-  STATE_CARD_DETECTED,
-  STATE_SCANNING_BLE,
-  STATE_SUCCESS,
-  STATE_FRAUD,
-  STATE_ERROR,
-  STATE_REGISTRATION
-};
+// ======================== FORWARD DECLARATIONS ========================
+void rfidScanTask(void* param);
+void validationProcessTask(void* param);
+void mqttTask(void* param);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void reconnectMQTT();
+void publishMQTT(const char* topic, const char* payload);
+String getCardUID();
 
-// ═══════════════════════════════════════════════════════════════
-//                        GLOBAL VARIABLES
-// ═══════════════════════════════════════════════════════════════
-
-String detectedBeaconUUID = "";
-int detectedRSSI = -100;
-std::vector<BLEDeviceInfo> scannedDevices;
-bool isRegistrationMode = false;
-bool registrationEnabled = false; // Controlled by Gateway
-
-volatile SystemState currentState = STATE_STANDBY;
-String currentCardUID = "";
-String currentNPM = "";
-String currentNama = "";
-
-unsigned long totalScans = 0;
-unsigned long successScans = 0;
-unsigned long fraudAttempts = 0;
-
-// FreeRTOS
-TaskHandle_t Task_RFID_Handle;
-TaskHandle_t Task_Display_Handle;
-SemaphoreHandle_t xDisplayMutex;
-
-// ═══════════════════════════════════════════════════════════════
-//                        BLE CALLBACK
-// ═══════════════════════════════════════════════════════════════
-
-class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice advertisedDevice) {
-    if (advertisedDevice.haveServiceUUID()) {
-      BLEUUID serviceUUID = advertisedDevice.getServiceUUID();
-      String uuidStr = serviceUUID.toString().c_str();
-      int rssi = advertisedDevice.getRSSI();
-      String name = advertisedDevice.haveName() ? advertisedDevice.getName().c_str() : "Unknown";
-      
-      if (isRegistrationMode) {
-        BLEDeviceInfo device;
-        device.uuid = uuidStr;
-        device.name = name;
-        device.rssi = rssi;
-        scannedDevices.push_back(device);
+// ======================== BLE CALLBACK ========================
+class BLECallback : public NimBLEAdvertisedDeviceCallbacks {
+  void onResult(NimBLEAdvertisedDevice* device) {
+    if (xSemaphoreTake(bleMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      if (device->haveServiceUUID()) {
+        NimBLEUUID uuid = device->getServiceUUID();
+        String uuidStr = uuid.toString().c_str();
+        int rssi = device->getRSSI();
         
-        Serial.print("  [");
-        Serial.print(scannedDevices.size());
-        Serial.print("] ");
-        Serial.print(name);
-        Serial.print(" | RSSI: ");
-        Serial.println(rssi);
-      } else {
-        if (rssi > detectedRSSI && rssi > RSSI_THRESHOLD) {
-          detectedBeaconUUID = uuidStr;
-          detectedRSSI = rssi;
+        if (rssi > detectedBLERSSI && rssi >= RSSI_THRESHOLD) {
+          detectedBLEUUID = uuidStr;
+          detectedBLERSSI = rssi;
+          Serial.printf("[BLE] Found: %s, RSSI: %d\n", uuidStr.c_str(), rssi);
         }
       }
+      xSemaphoreGive(bleMutex);
     }
   }
 };
 
-// ═══════════════════════════════════════════════════════════════
-//                        MESH CALLBACKS
-// ═══════════════════════════════════════════════════════════════
-
-void receivedCallback(uint32_t from, String &msg) {
-  Serial.printf("[MESH] Received from %u: %s\n", from, msg.c_str());
-  
-  // Parse JSON message
-  StaticJsonDocument<512> doc;
-  DeserializationError error = deserializeJson(doc, msg);
-  
-  if (error) {
-    Serial.println("[MESH] JSON parse failed!");
-    return;
+// ======================== MQTT CALLBACK ========================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg = "";
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
   }
   
-  String msgType = doc["type"];
+  Serial.printf("[MQTT] Received from %s: %s\n", topic, msg.c_str());
   
-  if (msgType == "ENABLE_REGISTER") {
-    registrationEnabled = doc["enabled"];
-    Serial.printf("[MESH] Registration mode: %s\n", registrationEnabled ? "ENABLED" : "DISABLED");
-    
-    if (registrationEnabled) {
-      displayMessage("REGISTRATION", "MODE ENABLED", "Tap card to", "register");
-      successBeep();
+  // Topic: atlas/mode (Master sends register/default)
+  if (strcmp(topic, TOPIC_MODE) == 0) {
+    if (msg == "register") {
+      registerMode = true;
+      Serial.println(">>> MODE: REGISTER <<<");
+      Serial.println("Tap kartu untuk registrasi...");
     } else {
-      displayMessage("REGISTRATION", "MODE DISABLED", "", "");
-      errorBeep();
-      delay(2000);
-      currentState = STATE_STANDBY;
+      registerMode = false;
+      Serial.println(">>> MODE: DEFAULT <<<");
+    }
+  }
+  
+  // Topic: atlas/register (Master sends uid|npm|serviceUUID)
+  else if (strcmp(topic, TOPIC_REGISTER_DATA) == 0) {
+    Serial.printf("[DEBUG] Raw registration data: '%s'\n", msg.c_str());
+    
+    int idx1 = msg.indexOf('|');
+    int idx2 = msg.indexOf('|', idx1 + 1);
+    
+    Serial.printf("[DEBUG] idx1=%d, idx2=%d, length=%d\n", idx1, idx2, msg.length());
+    
+    if (idx1 > 0 && idx2 > idx1) {
+      String uid = msg.substring(0, idx1);
+      String npm = msg.substring(idx1 + 1, idx2);
+      String serviceUUID = msg.substring(idx2 + 1);
+      
+      Serial.println("[DEBUG] Parsed data:");
+      Serial.printf("  UID : '%s' (len=%d)\n", uid.c_str(), uid.length());
+      Serial.printf("  NPM : '%s' (len=%d)\n", npm.c_str(), npm.length());
+      Serial.printf("  UUID: '%s' (len=%d)\n", serviceUUID.c_str(), serviceUUID.length());
+      
+      // Create safe key (UID without spaces)
+      String safeKey = uid;
+      safeKey.replace(" ", "");
+      
+      Serial.printf("[DEBUG] Safe key: '%s'\n", safeKey.c_str());
+      
+      // Store as: npm|serviceUUID
+      String value = npm + "|" + serviceUUID;
+      
+      if (xSemaphoreTake(prefsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        prefs.putString(safeKey.c_str(), value);
+        Serial.printf("[DEBUG] Stored to NVS: key='%s', value='%s'\n", safeKey.c_str(), value.c_str());
+        xSemaphoreGive(prefsMutex);
+      }
+      
+      Serial.println("\n✓ Registration data received and stored!");
+      Serial.printf("  UID : %s\n", uid.c_str());
+      Serial.printf("  NPM : %s\n", npm.c_str());
+      Serial.printf("  UUID: %s\n\n", serviceUUID.c_str());
+    } else {
+      Serial.printf("✗ Invalid format! Expected 'uid|npm|uuid', got '%s'\n", msg.c_str());
     }
   }
 }
 
-void newConnectionCallback(uint32_t nodeId) {
-  Serial.printf("[MESH] New Connection, nodeId = %u\n", nodeId);
+// ======================== MQTT HELPER FUNCTIONS ========================
+void reconnectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to MQTT...");
+    if (mqttClient.connect(mqtt_client_id)) {
+      Serial.println(" connected!");
+      mqttClient.subscribe(TOPIC_MODE);
+      mqttClient.subscribe(TOPIC_REGISTER_DATA);
+      Serial.println("✓ MQTT subscribed to topics");
+    } else {
+      Serial.printf(" failed, rc=%d. Retry in 5s\n", mqttClient.state());
+      delay(5000);
+    }
+  }
 }
 
-void changedConnectionCallback() {
-  Serial.println("[MESH] Connections changed");
+void publishMQTT(const char* topic, const char* payload) {
+  if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    if (mqttClient.connected()) {
+      mqttClient.publish(topic, payload);
+      Serial.printf("[MQTT] Published to %s: %s\n", topic, payload);
+    }
+    xSemaphoreGive(mqttMutex);
+  }
 }
 
-void nodeTimeAdjustedCallback(int32_t offset) {
-  Serial.printf("[MESH] Time adjusted. Offset = %d\n", offset);
-}
-
-// ═══════════════════════════════════════════════════════════════
-//                        MESH SEND FUNCTIONS
-// ═══════════════════════════════════════════════════════════════
-
-void sendAttendanceLog(String npm, String nama, bool success, int rssi) {
-  StaticJsonDocument<512> doc;
-  doc["type"] = "ATTENDANCE";
-  doc["node"] = NODE_NAME;
-  doc["npm"] = npm;
-  doc["nama"] = nama;
-  doc["success"] = success;
-  doc["rssi"] = rssi;
-  doc["timestamp"] = mesh.getNodeTime();
-  
-  String msg;
-  serializeJson(doc, msg);
-  
-  mesh.sendBroadcast(msg);
-  Serial.println("[MESH] Attendance log sent");
-}
-
-void sendRegistrationComplete(String npm, String nama) {
-  StaticJsonDocument<512> doc;
-  doc["type"] = "NEW_REGISTRATION";
-  doc["node"] = NODE_NAME;
-  doc["npm"] = npm;
-  doc["nama"] = nama;
-  doc["timestamp"] = mesh.getNodeTime();
-  
-  String msg;
-  serializeJson(doc, msg);
-  
-  mesh.sendBroadcast(msg);
-  Serial.println("[MESH] Registration complete notification sent");
-}
-
-void sendSystemStats() {
-  StaticJsonDocument<512> doc;
-  doc["type"] = "STATS";
-  doc["node"] = NODE_NAME;
-  doc["total_students"] = preferences.getInt("count", 0);
-  doc["total_scans"] = totalScans;
-  doc["success_scans"] = successScans;
-  doc["fraud_attempts"] = fraudAttempts;
-  
-  String msg;
-  serializeJson(doc, msg);
-  
-  mesh.sendBroadcast(msg);
-  Serial.println("[MESH] System stats sent");
-}
-
-// ═══════════════════════════════════════════════════════════════
-//                        SETUP FUNCTION
-// ═══════════════════════════════════════════════════════════════
-
+// ======================== SETUP ========================
 void setup() {
   Serial.begin(115200);
-  while (!Serial);
+  delay(1000);
   
-  printHeader();
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║     ATLAS SLAVE - RFID + BLE          ║");
+  Serial.println("║     MQTT with RTOS                     ║");
+  Serial.println("║     Broker: HiveMQ                     ║");
+  Serial.println("╚════════════════════════════════════════╝\n");
   
-  // Initialize Pins
-  pinMode(LED_GREEN, OUTPUT);
-  pinMode(LED_RED, OUTPUT);
-  pinMode(BUZZER, OUTPUT);
-  digitalWrite(LED_GREEN, LOW);
-  digitalWrite(LED_RED, LOW);
-  digitalWrite(BUZZER, LOW);
-  
-  // Initialize OLED
-  Wire.begin(SDA_PIN, SCL_PIN);
-  if(!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
-    Serial.println(F("✗ OLED init failed!"));
-    while(1);
-  }
-  display.clearDisplay();
-  displayBoot();
-  Serial.println("✓ OLED Display initialized");
-  
-  // Initialize Preferences
-  preferences.begin(PREF_NAMESPACE, false);
-  Serial.println("✓ Preferences initialized");
-  
-  // Initialize RFID
+  // Init RFID
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   mfrc522.PCD_Init();
-  delay(100);
-  Serial.println("✓ RFID RC522 initialized");
+  mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);
+  Serial.println("✓ RFID initialized");
   
-  // Initialize BLE
-  BLEDevice::init("ATLAS_Node");
-  pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  // Init BLE
+  NimBLEDevice::init("ATLAS_Slave");
+  pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new BLECallback(), false);
   pBLEScan->setActiveScan(true);
   pBLEScan->setInterval(100);
   pBLEScan->setWindow(99);
-  Serial.println("✓ BLE Scanner initialized");
+  Serial.println("✓ BLE initialized");
   
-  // Initialize Mesh
-  Serial.println("\n[MESH] Initializing Mesh Network...");
-  mesh.setDebugMsgTypes(ERROR | STARTUP);
-  mesh.init(MESH_PREFIX, MESH_PASSWORD, MESH_PORT);
-  mesh.onReceive(&receivedCallback);
-  mesh.onNewConnection(&newConnectionCallback);
-  mesh.onChangedConnections(&changedConnectionCallback);
-  mesh.onNodeTimeAdjusted(&nodeTimeAdjustedCallback);
-  Serial.println("✓ Mesh Network initialized");
-  Serial.printf("  Node ID: %u\n", mesh.getNodeId());
+  // Init WiFi
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✓ WiFi connected");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
   
-  // Create Semaphores
-  xDisplayMutex = xSemaphoreCreateMutex();
+  // Init MQTT
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setKeepAlive(60);
+  mqttClient.setSocketTimeout(30);
   
-  // Create FreeRTOS Tasks
-  Serial.println("\n[FreeRTOS] Creating tasks...");
+  reconnectMQTT();
   
-  xTaskCreatePinnedToCore(
-    Task_RFID,
-    "RFID_Scanner",
-    4096,
-    NULL,
-    3,
-    &Task_RFID_Handle,
-    0
-  );
-  Serial.println("  ✓ Task_RFID created");
+  // Init Preferences
+  prefs.begin("atlas_slave", false);
+  Serial.println("✓ Preferences initialized");
   
-  xTaskCreatePinnedToCore(
-    Task_Display,
-    "Display_Update",
-    4096,
-    NULL,
-    1,
-    &Task_Display_Handle,
-    0
-  );
-  Serial.println("  ✓ Task_Display created");
+  // Create RTOS primitives
+  cardQueue = xQueueCreate(5, sizeof(CardData));
+  prefsMutex = xSemaphoreCreateMutex();
+  bleMutex = xSemaphoreCreateMutex();
+  mqttMutex = xSemaphoreCreateMutex();
   
-  printStatistics();
-  Serial.println("\n[SYSTEM] Ready. Waiting for card or mesh command...\n");
-  
-  currentState = STATE_STANDBY;
-  startupBeep();
-}
-
-// ═══════════════════════════════════════════════════════════════
-//                        MAIN LOOP
-// ═══════════════════════════════════════════════════════════════
-
-void loop() {
-  mesh.update();
-  
-  // Send stats every 30 seconds
-  static unsigned long lastStatsTime = 0;
-  if (millis() - lastStatsTime > 30000) {
-    sendSystemStats();
-    lastStatsTime = millis();
+  if (!cardQueue || !prefsMutex || !bleMutex || !mqttMutex) {
+    Serial.println("✗ RTOS init failed");
+    while(1) delay(1000);
   }
   
-  delay(10);
+  // Create tasks
+  xTaskCreatePinnedToCore(rfidScanTask, "RFID", 4096, NULL, 2, &rfidTaskHandle, 0);
+  xTaskCreatePinnedToCore(validationProcessTask, "Validation", 6144, NULL, 1, &validationTaskHandle, 1);
+  xTaskCreatePinnedToCore(mqttTask, "MQTT", 4096, NULL, 2, &mqttTaskHandle, 0);
+  
+  Serial.println("✓ RTOS tasks created");
+  Serial.println("\n>>> MODE: DEFAULT <<<");
+  Serial.println("Ready. Waiting for card scan...\n");
 }
 
-// ═══════════════════════════════════════════════════════════════
-//                    FREERTOS TASK: RFID SCANNER
-// ═══════════════════════════════════════════════════════════════
+// ======================== LOOP ========================
+void loop() {
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
 
-void Task_RFID(void *pvParameters) {
-  Serial.println("[Task_RFID] Started on Core " + String(xPortGetCoreID()));
+// ======================== HELPER FUNCTIONS ========================
+String getCardUID() {
+  String uid = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    if (mfrc522.uid.uidByte[i] < 0x10) uid += " 0";
+    else uid += " ";
+    uid += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  uid.trim();
+  return uid;
+}
+
+// ======================== RTOS TASKS ========================
+
+/**
+ * Task: MQTT Management
+ * Handles MQTT connection and loop
+ */
+void mqttTask(void* param) {
+  Serial.println("[Task] MQTT started on core 0");
   
-  for(;;) {
-    if (currentState == STATE_STANDBY || (currentState == STATE_REGISTRATION && registrationEnabled)) {
+  while (1) {
+    if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      if (!mqttClient.connected()) {
+        reconnectMQTT();
+      }
+      mqttClient.loop();
+      xSemaphoreGive(mqttMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+/**
+ * Task: RFID Scanner
+ * Continuously scans for RFID cards and pushes to queue
+ */
+void rfidScanTask(void* param) {
+  Serial.println("[Task] RFID started on core 0");
+  
+  while (1) {
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      String uid = getCardUID();
+      String safeKey = uid;
+      safeKey.replace(" ", "");
       
-      if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      Serial.println("\n╔════════════════════════════════════════╗");
+      Serial.println("║         KARTU TERDETEKSI               ║");
+      Serial.println("╚════════════════════════════════════════╝");
+      Serial.printf("UID: %s\n", uid.c_str());
+      
+      CardData card;
+      card.uid = uid;
+      card.safeKey = safeKey;
+      
+      if (xQueueSend(cardQueue, &card, pdMS_TO_TICKS(200)) != pdPASS) {
+        Serial.println("✗ Queue full");
+      }
+      
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+      
+      vTaskDelay(pdMS_TO_TICKS(1500));
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+/**
+ * Task: Validation and Processing
+ * Handles both register and default modes
+ */
+void validationProcessTask(void* param) {
+  Serial.println("[Task] Validation started on core 1");
+  CardData card;
+  
+  while (1) {
+    if (xQueueReceive(cardQueue, &card, pdMS_TO_TICKS(200)) == pdPASS) {
+      
+      if (registerMode) {
+        // ========== REGISTER MODE ==========
+        Serial.println("\n[REGISTER] Sending UID to master...");
+        publishMQTT(TOPIC_CARD_SCANNED, card.uid.c_str());
+        Serial.println("✓ UID sent, waiting for master to complete registration");
         
-        String cardUID = getCardUID();
-        currentCardUID = cardUID;
+      } else {
+        // ========== DEFAULT MODE: VALIDATION ==========
+        Serial.println("\n[VALIDATION] Checking database...");
         
-        Serial.println("\n╔════════════════════════════════════════╗");
-        Serial.println("║      KARTU TERDETEKSI!                ║");
-        Serial.println("╚════════════════════════════════════════╝");
-        Serial.print("UID: ");
-        Serial.println(cardUID);
-        
-        String safeKey = cardUID;
-        safeKey.replace(" ", "");
-        
-        // Check if in registration mode
-        if (registrationEnabled) {
-          currentState = STATE_REGISTRATION;
-          registerCard(cardUID, safeKey);
-        } else {
-          // Normal attendance mode
-          if (preferences.isKey(safeKey.c_str())) {
-            currentState = STATE_CARD_DETECTED;
-            processAttendance(cardUID, safeKey);
-          } else {
-            Serial.println("✗ Kartu tidak terdaftar!");
-            Serial.println("  Minta dosen untuk enable registration mode.\n");
-            currentState = STATE_ERROR;
-            displayMessage("ERROR", "Card Not", "Registered", "");
-            errorBeep();
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
-            currentState = STATE_STANDBY;
-          }
+        String storedData = "";
+        if (xSemaphoreTake(prefsMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+          Serial.printf("[DEBUG] Looking for key: '%s'\n", card.safeKey.c_str());
+          storedData = prefs.getString(card.safeKey.c_str(), "");
+          Serial.printf("[DEBUG] Found data: '%s' (len=%d)\n", 
+                        storedData.length() > 0 ? storedData.c_str() : "(empty)", 
+                        storedData.length());
+          xSemaphoreGive(prefsMutex);
         }
         
-        mfrc522.PICC_HaltA();
-        mfrc522.PCD_StopCrypto1();
+        if (storedData.length() == 0) {
+          Serial.println("✗ Kartu tidak terdaftar");
+          Serial.println("Minta admin untuk registrasi kartu ini.\n");
+          continue;
+        }
         
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        // Parse: npm|serviceUUID
+        int pipeIdx = storedData.indexOf('|');
+        if (pipeIdx == -1) {
+          Serial.println("✗ Data corrupt");
+          continue;
+        }
+        
+        String npm = storedData.substring(0, pipeIdx);
+        String storedUUID = storedData.substring(pipeIdx + 1);
+        
+        Serial.printf("NPM: %s\n", npm.c_str());
+        Serial.printf("Stored UUID: %s\n", storedUUID.c_str());
+        
+        // Scan BLE
+        Serial.println("\n[BLE] Scanning...");
+        detectedBLEUUID = "";
+        detectedBLERSSI = -100;
+        
+        if (xSemaphoreTake(bleMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+          pBLEScan->start(BLE_SCAN_TIME, false);
+          xSemaphoreGive(bleMutex);
+        }
+        
+        pBLEScan->clearResults();
+        
+        // Validate
+        Serial.println("\n╔════════════════════════════════════════╗");
+        Serial.println("║         HASIL VALIDASI                 ║");
+        Serial.println("╠════════════════════════════════════════╣");
+        
+        bool valid = false;
+        
+        if (xSemaphoreTake(bleMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+          if (detectedBLEUUID.length() > 0) {
+            String detUpper = detectedBLEUUID;
+            String storedUpper = storedUUID;
+            detUpper.toUpperCase();
+            storedUpper.toUpperCase();
+            
+            if (detUpper == storedUpper) {
+              valid = true;
+            }
+          }
+          xSemaphoreGive(bleMutex);
+        }
+        
+        if (valid) {
+          Serial.println("║ Status: ✓✓✓ VALID ✓✓✓                 ║");
+          Serial.printf("║ RSSI  : %d dBm                     ║\n", detectedBLERSSI);
+          Serial.println("║ ✓ Kartu: OK                            ║");
+          Serial.println("║ ✓ BLE  : OK                            ║");
+          Serial.println("║ ABSENSI DITERIMA                       ║");
+          Serial.println("╚════════════════════════════════════════╝\n");
+          
+          // Send to master: uid|npm|rssi|valid
+          char payload[200];
+          snprintf(payload, sizeof(payload), "%s|%s|%d|1", 
+                   card.uid.c_str(), npm.c_str(), detectedBLERSSI);
+          publishMQTT(TOPIC_ATTENDANCE, payload);
+          
+        } else {
+          Serial.println("║ Status: ✗✗✗ INVALID ✗✗✗               ║");
+          Serial.println("║ ✓ Kartu: OK                            ║");
+          Serial.println("║ ✗ BLE  : TIDAK COCOK                   ║");
+          Serial.println("║ ABSENSI DITOLAK                        ║");
+          Serial.println("╚════════════════════════════════════════╝\n");
+          
+          // Send invalid: uid|unknown|0|0
+          char payload[200];
+          snprintf(payload, sizeof(payload), "%s|Unknown|0|0", card.uid.c_str());
+          publishMQTT(TOPIC_ATTENDANCE, payload);
+        }
       }
     }
     
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
-}
-
-// ═══════════════════════════════════════════════════════════════
-//                  FREERTOS TASK: DISPLAY UPDATE
-// ═══════════════════════════════════════════════════════════════
-
-void Task_Display(void *pvParameters) {
-  Serial.println("[Task_Display] Started on Core " + String(xPortGetCoreID()));
-  
-  for(;;) {
-    if (xSemaphoreTake(xDisplayMutex, portMAX_DELAY) == pdTRUE) {
-      
-      switch(currentState) {
-        case STATE_STANDBY:
-          displayStandby();
-          break;
-        case STATE_CARD_DETECTED:
-          displayCardDetected();
-          break;
-        case STATE_SCANNING_BLE:
-          displayScanning();
-          break;
-        case STATE_SUCCESS:
-          displaySuccess();
-          break;
-        case STATE_FRAUD:
-          displayFraud();
-          break;
-        case STATE_REGISTRATION:
-          // Handled in registerCard function
-          break;
-      }
-      
-      xSemaphoreGive(xDisplayMutex);
-    }
-    
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════
-//                      CORE FUNCTIONS
-// ═══════════════════════════════════════════════════════════════
-
-String getCardUID() {
-  String content = "";
-  for (byte i = 0; i < mfrc522.uid.size; i++) {
-    if (mfrc522.uid.uidByte[i] < 0x10) content += " 0";
-    else content += " ";
-    content += String(mfrc522.uid.uidByte[i], HEX);
-  }
-  content.toUpperCase();
-  content.trim();
-  return content;
-}
-
-void processAttendance(String cardUID, String safeKey) {
-  totalScans++;
-  
-  String value = preferences.getString(safeKey.c_str(), "");
-  if (value.length() == 0) return;
-  
-  int idx1 = value.indexOf('|');
-  int idx2 = value.indexOf('|', idx1 + 1);
-  int idx3 = value.indexOf('|', idx2 + 1);
-  
-  String npm = value.substring(0, idx1);
-  String nama = value.substring(idx1 + 1, idx2);
-  String beaconUUID = value.substring(idx2 + 1, idx3);
-  
-  currentNPM = npm;
-  currentNama = nama;
-  
-  Serial.println("\n--- Data Mahasiswa ---");
-  Serial.print("NPM  : ");
-  Serial.println(npm);
-  Serial.print("Nama : ");
-  Serial.println(nama);
-  
-  // Scan BLE
-  Serial.println("\n[BLE] Scanning for phone signal...");
-  currentState = STATE_SCANNING_BLE;
-  
-  isRegistrationMode = false;
-  detectedBeaconUUID = "";
-  detectedRSSI = -100;
-  
-  BLEScanResults* foundDevices = pBLEScan->start(BLE_SCAN_QUICK, false);
-  pBLEScan->clearResults();
-  
-  // Validate
-  bool beaconFound = false;
-  
-  if (detectedBeaconUUID.length() > 0) {
-    detectedBeaconUUID.toUpperCase();
-    beaconUUID.toUpperCase();
-    
-    if (detectedBeaconUUID.indexOf(npm) >= 0 || detectedBeaconUUID == beaconUUID) {
-      beaconFound = true;
-    }
-  }
-  
-  if (beaconFound) {
-    // SUCCESS
-    successScans++;
-    currentState = STATE_SUCCESS;
-    
-    Serial.println("✓✓✓ HADIR ✓✓✓");
-    Serial.print("RSSI: ");
-    Serial.print(detectedRSSI);
-    Serial.println(" dBm");
-    
-    updateScanCount(safeKey, value);
-    sendAttendanceLog(npm, nama, true, detectedRSSI);
-    successBeep();
-    
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
-    
-  } else {
-    // FRAUD
-    fraudAttempts++;
-    currentState = STATE_FRAUD;
-    
-    Serial.println("✗✗✗ FRAUD ALERT ✗✗✗");
-    Serial.println("Phone not detected!");
-    
-    sendAttendanceLog(npm, nama, false, -100);
-    fraudBeep();
-    
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
-  }
-  
-  currentState = STATE_STANDBY;
-}
-
-void registerCard(String cardUID, String safeKey) {
-  Serial.println("\n[REGISTRATION] Starting registration...");
-  
-  displayMessage("STEP 1", "Enter NPM", "via Serial", "");
-  
-  Serial.print("Enter NPM: ");
-  String npm = waitForSerialInput(60000);
-  if (npm.length() == 0) {
-    Serial.println("\nTimeout!");
-    currentState = STATE_STANDBY;
-    return;
-  }
-  Serial.println(npm);
-  
-  displayMessage("STEP 2", "Enter Name", "via Serial", "");
-  
-  Serial.print("Enter Name: ");
-  String nama = waitForSerialInput(60000);
-  if (nama.length() == 0) {
-    Serial.println("\nTimeout!");
-    currentState = STATE_STANDBY;
-    return;
-  }
-  Serial.println(nama);
-  
-  // Scan BLE
-  displayMessage("STEP 3", "Scanning", "BLE Devices", "...");
-  
-  Serial.println("\n[BLE] Scanning for devices...");
-  scannedDevices.clear();
-  isRegistrationMode = true;
-  
-  BLEScanResults* foundDevices = pBLEScan->start(BLE_SCAN_TIME, false);
-  pBLEScan->clearResults();
-  isRegistrationMode = false;
-  
-  if (scannedDevices.size() == 0) {
-    Serial.println("No devices found!");
-    displayMessage("ERROR", "No BLE", "Devices", "Found");
-    errorBeep();
-    vTaskDelay(2000 / portTICK_PERIOD_MS);
-    currentState = STATE_STANDBY;
-    return;
-  }
-  
-  // Display list
-  displayBLEListSerial();
-  
-  displayMessage("STEP 4", "Select Device", "via Serial", "");
-  
-  Serial.print("Select device (1-");
-  Serial.print(scannedDevices.size());
-  Serial.print("): ");
-  
-  String choice = waitForSerialInput(30000);
-  if (choice.length() == 0) {
-    Serial.println("\nTimeout!");
-    currentState = STATE_STANDBY;
-    return;
-  }
-  Serial.println(choice);
-  
-  int selectedIndex = choice.toInt() - 1;
-  
-  if (selectedIndex < 0 || selectedIndex >= scannedDevices.size()) {
-    Serial.println("Invalid choice!");
-    currentState = STATE_STANDBY;
-    return;
-  }
-  
-  // Save
-  String selectedUUID = scannedDevices[selectedIndex].uuid;
-  String value = npm + "|" + nama + "|" + selectedUUID + "|0";
-  preferences.putString(safeKey.c_str(), value);
-  
-  int count = preferences.getInt("count", 0);
-  count++;
-  preferences.putInt("count", count);
-  
-  String uidList = preferences.getString("uid_list", "");
-  if (uidList.length() > 0) uidList += ";";
-  uidList += safeKey;
-  preferences.putString("uid_list", uidList);
-  
-  Serial.println("\n✓✓✓ REGISTRATION SUCCESS ✓✓✓");
-  Serial.print("NPM : ");
-  Serial.println(npm);
-  Serial.print("Name: ");
-  Serial.println(nama);
-  
-  displayMessage("SUCCESS!", npm, nama, "Registered");
-  sendRegistrationComplete(npm, nama);
-  successBeep();
-  
-  vTaskDelay(3000 / portTICK_PERIOD_MS);
-  currentState = STATE_STANDBY;
-}
-
-String waitForSerialInput(unsigned long timeout) {
-  String input = "";
-  unsigned long startTime = millis();
-  
-  while (input.length() == 0 && (millis() - startTime) < timeout) {
-    if (Serial.available() > 0) {
-      input = Serial.readStringUntil('\n');
-      input.trim();
-    }
-    delay(100);
-  }
-  
-  return input;
-}
-
-void updateScanCount(String safeKey, String value) {
-  int idx3 = value.lastIndexOf('|');
-  String baseValue = value.substring(0, idx3);
-  int scanCount = value.substring(idx3 + 1).toInt() + 1;
-  
-  String newValue = baseValue + "|" + String(scanCount);
-  preferences.putString(safeKey.c_str(), newValue);
-}
-
-void displayBLEListSerial() {
-  Serial.println("\n╔════════════════════════════════════════════════════════╗");
-  Serial.println("║           BLE DEVICES DETECTED                        ║");
-  Serial.println("╠════════════════════════════════════════════════════════╣");
-  
-  for (int i = 0; i < scannedDevices.size(); i++) {
-    Serial.print("║ [");
-    Serial.print(i + 1);
-    Serial.print("] ");
-    Serial.print(scannedDevices[i].name);
-    Serial.print(" | RSSI: ");
-    Serial.print(scannedDevices[i].rssi);
-    Serial.println(" dBm");
-  }
-  
-  Serial.println("╚════════════════════════════════════════════════════════╝");
-}
-
-// ═══════════════════════════════════════════════════════════════
-//                      DISPLAY FUNCTIONS
-// ═══════════════════════════════════════════════════════════════
-
-void displayBoot() {
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(25, 10);
-  display.println("ATLAS");
-  display.setTextSize(1);
-  display.setCursor(15, 35);
-  display.println("CLIENT NODE");
-  display.setCursor(10, 50);
-  display.print("ID: ");
-  display.println(NODE_NAME);
-  display.display();
-  delay(2000);
-}
-
-void displayStandby() {
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setCursor(20, 15);
-  display.println("READY");
-  display.setTextSize(1);
-  display.setCursor(10, 40);
-  
-  if (registrationEnabled) {
-    display.println("REG MODE: ON");
-  } else {
-    display.println("Tap Your Card");
-  }
-  
-  int count = preferences.getInt("count", 0);
-  display.setCursor(0, 55);
-  display.print("DB:");
-  display.print(count);
-  display.print(" S:");
-  display.print(successScans);
-  display.print(" F:");
-  display.print(fraudAttempts);
-  
-  display.display();
-}
-
-void displayCardDetected() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(0, 5);
-  display.println("Card Detected!");
-  display.setCursor(0, 20);
-  display.print("UID: ");
-  
-  String shortUID = currentCardUID;
-  if (shortUID.length() > 15) shortUID = shortUID.substring(0, 15);
-  display.println(shortUID);
-  
-  display.setCursor(0, 35);
-  display.println("Validating...");
-  display.display();
-}
-
-void displayScanning() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(5, 15);
-  display.println("Scanning for");
-  display.setCursor(5, 30);
-  display.println("Phone Signal...");
-  
-  static int dotCount = 0;
-  display.setCursor(5, 45);
-  for (int i = 0; i < dotCount; i++) {
-    display.print(".");
-  }
-  dotCount = (dotCount + 1) % 4;
-  
-  display.display();
-}
-
-void displaySuccess() {
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setCursor(5, 5);
-  display.println("WELCOME");
-  
-  display.setTextSize(1);
-  display.setCursor(5, 30);
-  String shortNama = currentNama;
-  if (shortNama.length() > 21) shortNama = shortNama.substring(0, 21);
-  display.println(shortNama);
-  
-  display.setCursor(5, 45);
-  display.println("ATTENDANCE OK");
-  
-  display.setCursor(5, 55);
-  display.print("RSSI: ");
-  display.print(detectedRSSI);
-  display.println(" dBm");
-  
-  display.display();
-}
-
-void displayFraud() {
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setCursor(15, 10);
-  display.println("FRAUD!");
-  
-  display.setTextSize(1);
-  display.setCursor(0, 35);
-  display.println("Phone Not Detected");
-  display.setCursor(0, 50);
-  display.println("Access DENIED!");
-  
-  display.display();
-}
-
-void displayMessage(String line1, String line2, String line3, String line4) {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(0, 10);
-  display.println(line1);
-  display.setCursor(0, 25);
-  display.println(line2);
-  display.setCursor(0, 40);
-  display.println(line3);
-  display.setCursor(0, 55);
-  display.println(line4);
-  display.display();
-}
-
-// ═══════════════════════════════════════════════════════════════
-//                      SOUND FUNCTIONS
-// ═══════════════════════════════════════════════════════════════
-
-void startupBeep() {
-  tone(BUZZER, 1000, 100);
-  delay(150);
-  tone(BUZZER, 1500, 100);
-}
-
-void successBeep() {
-  digitalWrite(LED_GREEN, HIGH);
-  tone(BUZZER, 2000, 100);
-  delay(150);
-  tone(BUZZER, 2500, 100);
-  delay(500);
-  digitalWrite(LED_GREEN, LOW);
-}
-
-void fraudBeep() {
-  for (int i = 0; i < 5; i++) {
-    digitalWrite(LED_RED, HIGH);
-    tone(BUZZER, 500, 200);
-    delay(200);
-    digitalWrite(LED_RED, LOW);
-    noTone(BUZZER);
-    delay(200);
-  }
-}
-
-void errorBeep() {
-  digitalWrite(LED_RED, HIGH);
-  tone(BUZZER, 300, 500);
-  delay(600);
-  digitalWrite(LED_RED, LOW);
-}
-
-// ═══════════════════════════════════════════════════════════════
-//                      UTILITY FUNCTIONS
-// ═══════════════════════════════════════════════════════════════
-
-void printHeader() {
-  Serial.println("\n╔════════════════════════════════════════════════════════╗");
-  Serial.println("║           PROJECT ATLAS - CLIENT NODE                 ║");
-  Serial.println("║              Rangkaian A (Pintu Kelas)                 ║");
-  Serial.println("╚════════════════════════════════════════════════════════╝\n");
-}
-
-void printStatistics() {
-  int count = preferences.getInt("count", 0);
-  
-  Serial.println("\n╔════════════════════════════════════════════════════════╗");
-  Serial.println("║              SYSTEM STATISTICS                         ║");
-  Serial.println("╠════════════════════════════════════════════════════════╣");
-  Serial.print("║  Registered Students : ");
-  Serial.println(count);
-  Serial.print("║  Total Scans        : ");
-  Serial.println(totalScans);
-  Serial.print("║  Success            : ");
-  Serial.println(successScans);
-  Serial.print("║  Fraud Attempts     : ");
-  Serial.println(fraudAttempts);
-  Serial.println("╚════════════════════════════════════════════════════════╝");
 }

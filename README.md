@@ -73,7 +73,7 @@ Pengujian dilakukan dalam tiga tahapan utama:
 
 Proyek ATLAS berhasil diimplementasikan sebagai solusi IoT untuk mengatasi masalah *proxy attendance*. Mekanisme verifikasi ganda (RFID + BLE) terbukti efektif menjamin kehadiran fisik mahasiswa dan mencegah titip absen.
 
-Penggunaan arsitektur *client-server* dengan protokol MQTT dan FreeRTOS menjamin komunikasi data yang stabil, *real-time*, dan responsif antara ruang kelas dan dashboard dosen. Seluruh *acceptance criteria* telah terpenuhi, termasuk fitur *fraud alert* otomatis. Untuk pengembangan selanjutnya, disarankan penambahan antarmuka visual pada node dan penggunaan database cloud terpusat untuk skalabilitas yang lebih baik.
+Penggunaan arsitektur *client-server* dengan protokol MQTT dan FreeRTOS menjamin komunikasi data yang stabil, *real-time*, dan responsif antara ruang kelas dan dashboard dosen. Seluruh *acceptance criteria* telah terpenuhi, termasuk fitur *fraud alert* otomatis. Untuk pengembangan selanjutnya, lebih baik ditambah visual feedback interface pada node dan penggunaan database cloud centralized untuk better scalability.
 
 ## v. References
 

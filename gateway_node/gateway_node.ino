@@ -9,8 +9,8 @@
 #include <Preferences.h>
 
 // WiFi
-const char* ssid = "CALNATH";
-const char* password = "Calvin2304";
+const char* ssid = "Alga";
+const char* password = "bonifasius1103";
 
 // MQTT HiveMQ Broker
 const char* mqtt_server = "broker.hivemq.com";
@@ -152,7 +152,7 @@ BLYNK_WRITE(V0) {
     terminal.flush();
     
     // Allow card scan anytime in register mode
-    if (pendingNPM.lenght() > 0) pendingServiceUUID.length() = "00000000-0000-0000-0000-00" + string(pendingNPM.length());
+    if (pendingNPM.length() > 0) pendingServiceUUID = "00000000-0000-0000-0000-00" + pendingNPM;
     if (pendingNPM.length() > 0 && pendingServiceUUID.length() > 0) {
       waitingForCard = true;
       terminal.println("Ready! Tap card now...");

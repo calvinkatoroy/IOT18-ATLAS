@@ -26,8 +26,8 @@
 #define MISO_PIN  19
 
 // ======================== WIFI CONFIG ========================
-const char* ssid = "CALNATH";
-const char* password = "Calvin2304";
+const char* ssid = "Alga";
+const char* password = "bonifasius1103";
 
 // ======================== MQTT CONFIG ========================
 const char* mqtt_server = "broker.hivemq.com";
